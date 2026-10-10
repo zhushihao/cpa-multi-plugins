@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -357,6 +358,12 @@ func hostAuthGetByIndex(authIndex string) ([]byte, error) {
 type storedAuth struct {
 	Auth    storedTokens  `json:"auth"`
 	Account storedAccount `json:"account"`
+
+	// fork (世豪 2026-10-11 授权): host-side routing metadata captured from the
+	// physical file at parse time and re-emitted via AuthData attributes so the
+	// selector's priority/weight buckets survive plugin auth updates.
+	priority *int
+	weight   *int
 }
 
 // storedTokens holds one credential family at a time in Access/RefreshToken,
@@ -404,7 +411,14 @@ func parseStored(raw []byte) (*storedAuth, error) {
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return nil, fmt.Errorf("storage_parse_error: %w", err)
 	}
+	var routing struct {
+		Priority *int `json:"priority"`
+		Weight   *int `json:"weight"`
+	}
+	_ = json.Unmarshal(raw, &routing)
 	var sa storedAuth
+	sa.priority = routing.Priority
+	sa.weight = routing.Weight
 	if _, nested := probe["auth"]; nested {
 		if err := json.Unmarshal(raw, &sa); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -592,6 +606,16 @@ func toAuthDataOptsWithNote(sa *storedAuth, cr *creditsSummary, disabled bool, p
 	}
 	label := labelForAuth(sa)
 	meta := enrichAuthMetadataWithPrev(sa, cr, disabled, prevCredits)
+	var attributes map[string]string
+	if sa != nil && (sa.priority != nil || sa.weight != nil) {
+		attributes = map[string]string{}
+		if sa.priority != nil {
+			attributes["priority"] = strconv.Itoa(*sa.priority)
+		}
+		if sa.weight != nil {
+			attributes["weight"] = strconv.Itoa(*sa.weight)
+		}
+	}
 	return pluginapi.AuthData{
 		Provider:    providerName,
 		ID:          id,
@@ -599,6 +623,7 @@ func toAuthDataOptsWithNote(sa *storedAuth, cr *creditsSummary, disabled bool, p
 		Label:       label,
 		Disabled:    disabled,
 		StorageJSON: storage,
+		Attributes:  attributes,
 		// Standardized auth metadata. `type` is required by the host for
 		// auth-file classification; `logo`/`note`/`disabled` surface on auth rows.
 		Metadata: meta,
