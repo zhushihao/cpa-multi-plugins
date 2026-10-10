@@ -163,6 +163,10 @@ func TestFilterCoolingModelsPerCredential(t *testing.T) {
 	if authID != "u_10086" {
 		t.Fatalf("authID = %q, want u_10086", authID)
 	}
+	// -count>1 safety: the cooldown table is process memory; without this a
+	// previous iteration's mark would make the "clean filter" assertion fail.
+	clearModelCooldown(authID, "")
+	defer clearModelCooldown(authID, "")
 	// No cooldowns → list untouched (same slice, zero allocs path).
 	if got := filterCoolingModels(sa, catalog); len(got) != 3 {
 		t.Fatalf("clean filter changed list size: %d", len(got))

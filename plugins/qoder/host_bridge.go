@@ -97,9 +97,10 @@ func hostBridgeUnwrap(raw []byte, method string) (json.RawMessage, error) {
 }
 
 // hostBridgeAvailable reports whether host.http.* RPC is wired up. False in
-// unit tests (no hostAPI) and when the host binary predates the bridge.
+// pure-Go builds (no cgo host table — abi_nocgo.go) and when the host binary
+// predates the bridge.
 func hostBridgeAvailable() bool {
-	return hostAPI != nil && hostAPI.call != nil
+	return hostAPIBridgeReady()
 }
 
 // hostHTTPDo performs a non-streaming upstream call via the host's http bridge.

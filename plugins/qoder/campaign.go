@@ -237,10 +237,13 @@ func performCampaignCheckin(sa *storedAuth) (map[string]any, error) {
 	billingHeaders(req, sa)
 	resp, err := hostHTTPDo(req)
 	if err != nil {
-		return map[string]any{"success": false, "message": err.Error()}, nil
+		// claim_error distinguishes a failed claim CALL (transport) from a 200
+		// that merely lacks CLAIMED — the scheduled pass reports the former as
+		// an error state, never as "unconfirmed" (m1).
+		return map[string]any{"success": false, "claim_error": true, "message": err.Error()}, nil
 	}
 	if resp.StatusCode >= 400 {
-		return map[string]any{"success": false, "message": fmt.Sprintf("http %d: %s", resp.StatusCode, truncateRedacted(string(resp.Body), 200))}, nil
+		return map[string]any{"success": false, "claim_error": true, "message": fmt.Sprintf("http %d: %s", resp.StatusCode, truncateRedacted(string(resp.Body), 200))}, nil
 	}
 	var m map[string]any
 	if err := json.Unmarshal(resp.Body, &m); err != nil {

@@ -92,7 +92,7 @@ func adoptForeignAuths() {
 		sa.Auth.Domain = domainForRegion(region)
 		disabled := parseDisabledFromAuthJSON(phys.JSON)
 		note := "migrated from " + map[string]string{regionCN: "qoder-cn", regionIntl: "qoder-intl"}[region]
-		if raw, err := buildAuthFileJSON(sa, disabled, note, nil); err == nil {
+		if raw, err := buildAuthFileJSON(sa, disabled, note, nil, phys.JSON); err == nil {
 			if err := hostAuthPersist(f.Name, "", raw); err != nil {
 				log.Printf("adopt %s: save failed: %v", f.Name, err)
 				continue

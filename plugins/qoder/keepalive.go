@@ -6,8 +6,8 @@
 // PAT re-exchange fallback) keeps accounts alive automatically.
 //
 //   - Runs on the existing schedulerLoop at 22:00 local (keepaliveHours is
-//     separate from checkinHours so the two cadences can evolve independently).
-//     separate from checkinHours so the two cadences can evolve independently).
+//     separate from the Beijing campaign claim slots in campaign_window.go so
+//     the two cadences can evolve independently).
 //   - Iterates all qoderwork auths via host.auth.list/get, calls
 //     {realm-base}/v2/plugin/auth/token/refresh with X-Refresh-Token via
 //     the host HTTP bridge (host.http.do).
@@ -31,7 +31,8 @@ import (
 )
 
 // keepaliveHours is the daily refresh schedule (local time). Kept separate
-// from checkinHours so the two cadences can evolve independently.
+// from the Beijing campaign claim slots (campaign_window.go) so the two
+// cadences can evolve independently.
 var keepaliveHours = []int{22}
 
 // keepaliveAuto gates the daily refresh. Default true; configurable via

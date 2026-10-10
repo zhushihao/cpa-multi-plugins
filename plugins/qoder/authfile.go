@@ -198,7 +198,7 @@ func hostAuthSaveJSON(name string, raw []byte) error {
 
 // lifecycleStateUnchanged avoids redundant saves when note/disabled unchanged.
 
-func buildAuthFileJSON(sa *storedAuth, disabled bool, note string, extra map[string]any) ([]byte, error) {
+func buildAuthFileJSON(sa *storedAuth, disabled bool, note string, extra map[string]any, preserve []byte) ([]byte, error) {
 	if sa == nil {
 		return nil, fmt.Errorf("nil storedAuth")
 	}
@@ -218,6 +218,24 @@ func buildAuthFileJSON(sa *storedAuth, disabled bool, note string, extra map[str
 		"note":     note,
 		"auth":     nested["auth"],
 		"account":  nested["account"],
+	}
+	// fork fix (世豪 2026-10-10 授权): preserve unknown top-level fields from the
+	// existing physical file (priority/weight and future custom keys) so plugin
+	// rewrites no longer strip host-side routing metadata. Managed keys and the
+	// classification are never taken from preserve; extra still wins over it.
+	if len(preserve) > 0 {
+		var prev map[string]any
+		if err := json.Unmarshal(preserve, &prev); err == nil {
+			for k, v := range prev {
+				switch k {
+				case "type", "provider", "logo", "disabled", "note", "auth", "account", "auth_kind":
+					continue
+				}
+				if _, managed := out[k]; !managed {
+					out[k] = v
+				}
+			}
+		}
 	}
 	for k, v := range extra {
 		out[k] = v
@@ -307,4 +325,12 @@ func deleteAuthFileInDir(path, dir string) error {
 		return nil
 	}
 	return err
+}
+
+// physJSONOrNil guards nil hostAuthPhysical results for preserve merging.
+func physJSONOrNil(phys *hostAuthPhysical) []byte {
+	if phys == nil {
+		return nil
+	}
+	return phys.JSON
 }

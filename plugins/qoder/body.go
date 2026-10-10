@@ -331,6 +331,27 @@ func buildQoderBody(req *openAIRequest, modelKey, userType string) ([]byte, erro
 			assistantCarriesToolCalls(m) && isEmptyAssistantBody(m) {
 			m.Content, m.rawContent, m.contentSet = "Calling tools.", "", true
 		}
+		// The host's responses→chat request translator fills history turns
+		// whose reasoning summary was lost with the literal "[reasoning
+		// unavailable]" (openai_openai-responses_request.go fallbackToolReasoning).
+		// Qwen-family models parrot the bracketed token back as new thinking
+		// and the client then stores it verbatim — a self-propagating poison
+		// observed live on qfmodel (2026-09-30). Swap it for a neutral
+		// sentence before the history reaches upstream. Kept non-empty:
+		// reasoning-capable upstreams pair reasoning_content with tool_calls.
+		if rawRC, ok := m.raw["reasoning_content"]; ok {
+			var rs string
+			if err := json.Unmarshal(rawRC, &rs); err == nil &&
+				strings.TrimSpace(rs) == "[reasoning unavailable]" {
+				copied := make(map[string]json.RawMessage, len(m.raw)+1)
+				for k, v := range m.raw {
+					copied[k] = v
+				}
+				neutral, _ := json.Marshal("Previous reasoning content was not retained; continuing the task.")
+				copied["reasoning_content"] = neutral
+				m.raw = copied
+			}
+		}
 		outMsgs = append(outMsgs, m)
 	}
 	base["messages"] = outMsgs

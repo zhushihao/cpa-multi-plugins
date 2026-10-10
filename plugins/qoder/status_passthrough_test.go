@@ -76,12 +76,13 @@ func TestUpstreamStatusErrorPolicy(t *testing.T) {
 }
 
 // TestNextCheckinTimeSkipsBeforeOpeningHour guards the 10:00 opening-hour
-// fix: from 09:59 the next auto tick must be 10:00, never the stale 09:00.
+// fix: from 09:59 the next auto tick must fall inside the first campaign
+// slot window (10:05–10:20 Beijing), never the stale 09:00.
 func TestNextCheckinTimeSkipsBeforeOpeningHour(t *testing.T) {
 	loc := time.Local
 	now := time.Date(2026, 9, 20, 9, 59, 0, 0, loc)
 	next := nextCheckinTime(now)
-	if next.Hour() != 10 || next.Day() != now.Day() {
-		t.Fatalf("next = %s, want today 10:00", next)
+	if next.Hour() != 10 || next.Day() != now.Day() || next.Minute() < 5 || next.Minute() > 20 {
+		t.Fatalf("next = %s, want today 10:05–10:20", next)
 	}
 }

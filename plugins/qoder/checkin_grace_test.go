@@ -61,6 +61,50 @@ func TestRememberCheckinMoment_PreservesCacheEntry(t *testing.T) {
 	}
 }
 
+// TestApplyCampaignPassOutcomePendingCreditGrantsGrace — S1 regression
+// (2026-09-29 review): a CLAIMED-with-lagging-credits pass (pending_credit)
+// must grant the lifecycle grace window exactly like claimed/already.
+// Otherwise the same tick's forced reconcile can disable an account upstream
+// just credited (stale remain=0 snapshot).
+func TestApplyCampaignPassOutcomePendingCreditGrantsGrace(t *testing.T) {
+	const id = "grace-pending-credit"
+	defer accountCache.Delete(id)
+
+	applyCampaignPassOutcome(id, campaignPassResult{
+		State:         campaignStatePendingCredit,
+		CreditsBefore: &creditsSummary{TotalRemain: 0},
+		CreditsAfter:  &creditsSummary{TotalRemain: 0},
+		Summary:       &checkinSummary{Active: true},
+	})
+	if !checkinGraceActive(id) {
+		t.Fatal("pending_credit must grant the lifecycle grace window (S1)")
+	}
+	v, ok := accountCache.Load(id)
+	if !ok {
+		t.Fatal("pass outcome must populate the panel cache")
+	}
+	e := v.(*accountCacheEntry)
+	if e.checkin == nil || e.credits == nil {
+		t.Fatalf("panel cache missing the pass snapshot: %+v", e)
+	}
+	if e.checkinAt.IsZero() {
+		t.Fatal("cache merge wiped the grace stamp it had just set")
+	}
+}
+
+// TestApplyCampaignPassOutcomeNoEvidenceNoGrace: error / none / unconfirmed
+// carry no claim evidence and must not suppress reconcile.
+func TestApplyCampaignPassOutcomeNoEvidenceNoGrace(t *testing.T) {
+	for _, state := range []string{campaignStateError, campaignStateNone, campaignStateUnconfirmed} {
+		id := "grace-none-" + state
+		defer accountCache.Delete(id)
+		applyCampaignPassOutcome(id, campaignPassResult{State: state})
+		if checkinGraceActive(id) {
+			t.Fatalf("state %q must not grant lifecycle grace (no claim evidence)", state)
+		}
+	}
+}
+
 func TestNormalizeAlreadyClaimedBody(t *testing.T) {
 	// The detection strings performCheckinCall relies on: the upstream 409
 	// body carries result=ALREADY_CLAIMED. Keep the exact literal here so a

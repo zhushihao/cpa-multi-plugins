@@ -1,7 +1,12 @@
-// checkin.go implements daily check-in for CN accounts: the manual
-// handleManualCheckin endpoint, the 09:00 / 21:00 auto scheduler, and the
-// per-account mutex that prevents duplicate check-ins from racing browser
-// tabs. CN accounts are excluded — they use one-shot trial claims instead.
+// checkin.go implements daily check-in: the manual handleManualCheckin
+// endpoint, the Beijing-time auto scheduler (10:05 / 10:35 / 21:05 plus a
+// bounded per-process startup catch-up — see campaign_window.go), and the
+// per-account mutex that serializes duplicate check-ins inside this plugin
+// process (panel tab + scheduler). The mutex is process memory only: external
+// clients are not serialized, and the only cross-process guard is the upstream
+// CLAIMED/replay idempotency (unproven in the real environment — see I1 in
+// campaign_window.go). Both regions claim through the campaigns contract
+// (campaign.go).
 package main
 
 import (
@@ -35,14 +40,26 @@ func ensureScheduler() {
 // during its own runtime teardown, where touching Go sync primitives from the
 // plugin's c-shared runtime caused SIGSEGV on every restart.
 
+// nextCheckinTime returns the earliest upcoming tick: a Beijing wall-clock
+// campaign claim slot (10:05 / 10:35 / 21:05 — campaign_window.go) or a
+// host-local keepalive hour, whichever fires first. Campaign slots are
+// deliberately not host-local: the upstream activity opens at 10:00 Beijing,
+// so a host in another timezone must still claim on Beijing time.
 func nextCheckinTime(now time.Time) time.Time {
 	var earliest time.Time
-	// Consider both checkin and keepalive schedules so the timer wakes up for
-	// whichever fires first (e.g. 21:00 checkin vs 22:00 keepalive → 21:00 wins,
-	// then 22:00 keepalive fires on the next tick).
-	hours := append([]int{}, checkinHours...)
-	hours = append(hours, keepaliveHours...)
-	for _, h := range hours {
+	bj := now.In(campaignWindowZone)
+	for _, day := range []time.Time{bj, bj.AddDate(0, 0, 1)} {
+		for _, s := range campaignSlots {
+			t := campaignSlotTime(day, s)
+			if !t.After(now) {
+				continue
+			}
+			if earliest.IsZero() || t.Before(earliest) {
+				earliest = t
+			}
+		}
+	}
+	for _, h := range keepaliveHours {
 		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
 		if !t.After(now) {
 			t = t.Add(24 * time.Hour) // slot already passed today → tomorrow
@@ -55,6 +72,11 @@ func nextCheckinTime(now time.Time) time.Time {
 }
 
 func schedulerLoop(stop chan struct{}) {
+	// Bounded missed-window recovery: a (re)start inside the current Beijing
+	// window runs one catch-up pass (10:05 startup, failed/empty 10:05 pass,
+	// restart after a missed slot) — at most once per (process, window),
+	// in-memory only, never before the day's first slot. See campaignRecoveryDue.
+	runStartupRecoveryOnce(time.Now(), runAutoCheckin)
 	for {
 		next := nextCheckinTime(time.Now())
 		timer := time.NewTimer(time.Until(next))
@@ -66,7 +88,7 @@ func schedulerLoop(stop chan struct{}) {
 			runAutoCheckin()
 			// Fire keepalive if the current tick falls within its scheduled
 			// window (e.g. 22:00 keepalive fires on the 22:00 tick even though
-			// the previous checkin tick was 21:00).
+			// the previous checkin tick was 21:05).
 			if shouldRunKeepaliveNow(time.Now()) {
 				runTokenKeepalive()
 			}
@@ -74,9 +96,11 @@ func schedulerLoop(stop chan struct{}) {
 	}
 }
 
-// runAutoCheckin is the scheduled lifecycle tick (09:00 / 21:00).
-// CN: optional daily check-in, then reconcile (disable exhausted / reenable after credits).
-// CN: no auto trial (one-shot claim is manual only); reconcile may delete exhausted auths.
+// runAutoCheckin is the scheduled lifecycle tick (Beijing 10:05 / 10:35 /
+// 21:05, plus the bounded startup catch-up).
+// Both regions claim through the campaigns contract, then reconcile (disable
+// exhausted / reenable after credits). There is no auto trial (the one-shot
+// claim is manual only); reconcile may delete exhausted auths.
 //
 // v0.6.31: per-account work runs concurrently (sem=4) — was serial, so N accounts
 // meant 3N serial HTTP round-trips on the billing API. Matches the pattern used
@@ -89,6 +113,9 @@ func runAutoCheckin() {
 	if !doCheckin && !lifecycleEnabled() {
 		return
 	}
+	// A pass actually ran for the current Beijing window: bound the startup
+	// catch-up to one run per window (campaign_window.go).
+	markCampaignPassWindow(campaignWindowID(time.Now()))
 	files, err := hostAuthList()
 	if err != nil {
 		return
@@ -118,48 +145,13 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 		if err != nil {
 			return
 		}
-		// CN: daily check-in when enabled.
-		ci, err := fetchCheckinStatus(sa)
-		if err == nil && ci != nil && ci.Active && !ci.TodayCheckedIn {
-			if _, callErr := performCheckinCall(sa); callErr == nil {
-				// v0.8.8: 记录签到时刻（与手动签到一致），让紧随
-				// 其后的 reconcile 处于 lifecycle 宽限窗口内。
-				rememberCheckinMoment(f.ID)
-				// Refresh once after a successful checkin call so cache reflects
-				// the post-call state. If the status call fails keep the pre-call
-				// snapshot rather than dropping it (v0.6.31: avoid shadowing ci
-				// with a second fetch that could race with concurrent readers).
-				if ci2, _ := fetchCheckinStatus(sa); ci2 != nil {
-					ci = ci2
-				}
-				// P1-5: checkin grants new credits — refresh the credits cache
-				// immediately so the panel shows the updated balance without
-				// waiting for the async reconcile pass.
-				if cr2, crErr := fetchUserResource(sa); crErr == nil && cr2 != nil {
-					if v, ok := accountCache.Load(f.ID); ok {
-						if prev, ok2 := v.(*accountCacheEntry); ok2 {
-							fresh := *prev
-							fresh.credits = cr2
-							fresh.fetched = time.Now()
-							accountCache.Store(f.ID, &fresh)
-						}
-					}
-				}
-			}
-		}
-		// Refresh cache with latest checkin status (merge, don't wipe credits/plan).
-		if ci != nil {
-			var prev *accountCacheEntry
-			if v, ok := accountCache.Load(f.ID); ok {
-				prev, _ = v.(*accountCacheEntry)
-			}
-			entry := &accountCacheEntry{checkin: ci, fetched: time.Now()}
-			if prev != nil {
-				entry.credits = prev.credits
-				entry.plan = prev.plan
-			}
-			accountCache.Store(f.ID, entry)
-		}
+		// The Beijing-window campaign pass owns claim + credit confirmation +
+		// per-process account/campaign/window dedup (campaign_window.go).
+		res := campaignPassForAccount(sa, f.ID, f.AuthIndex, time.Now())
+		// Grace (only on claim evidence) + panel-cache refresh, in that order:
+		// the forced reconcile below must see the grace stamp for a
+		// claimed/already/pending_credit pass.
+		applyCampaignPassOutcome(f.ID, res)
 		if lifecycleEnabled() {
 			_, _ = reconcileOneAccount(f.AuthIndex, f.ID, true)
 		}
@@ -169,6 +161,54 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 	if lifecycleEnabled() {
 		_, _ = reconcileOneAccount(f.AuthIndex, f.ID, true)
 	}
+}
+
+// applyCampaignPassOutcome folds one scheduled pass result into the shared
+// per-account state:
+//
+//   - lifecycle grace on claim evidence — campaignStateGrantsLifecycleGrace
+//     covers claimed / already / pending_credit (CLAIMED with the credit pool
+//     still lagging). Error / none / unconfirmed carry no evidence and must
+//     not suppress reconcile the way the old "any response" stamp did (S1,
+//     2026-09-29 review);
+//   - a panel-cache refresh merged from the pass snapshot (never wipes plan, a
+//     prior credits snapshot, or an existing grace stamp — the previous merge
+//     dropped checkinAt, which silently cancelled the grace it had just set).
+//
+// Extracted from processAutoCheckinAccount so this glue is testable without
+// host RPC.
+func applyCampaignPassOutcome(authID string, res campaignPassResult) {
+	if campaignStateGrantsLifecycleGrace(res.State) {
+		rememberCheckinMoment(authID)
+	}
+	if res.Summary == nil && res.CreditsAfter == nil && res.CreditsBefore == nil {
+		return
+	}
+	var prev *accountCacheEntry
+	if v, ok := accountCache.Load(authID); ok {
+		prev, _ = v.(*accountCacheEntry)
+	}
+	entry := &accountCacheEntry{checkin: res.Summary, credits: res.CreditsAfter, fetched: time.Now()}
+	if entry.credits == nil {
+		entry.credits = res.CreditsBefore
+	}
+	if prev != nil {
+		if entry.checkin == nil {
+			entry.checkin = prev.checkin
+		}
+		if entry.credits == nil {
+			entry.credits = prev.credits
+		}
+		entry.plan = prev.plan
+		entry.checkinAt = prev.checkinAt
+	}
+	// Stamp only our own fresh snapshot — never mutate a shared entry.
+	if res.CreditsAfter != nil {
+		res.CreditsAfter.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+	} else if res.CreditsBefore != nil && entry.credits == res.CreditsBefore {
+		res.CreditsBefore.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	accountCache.Store(authID, entry)
 }
 
 // handleManualCheckin checks in one account (auth_index) or all qoderwork
@@ -326,6 +366,10 @@ func checkinOneAccount(f pluginapi.HostAuthFileEntry) map[string]any {
 			out["reward_credits"] = int64(rc)
 		}
 		out["message"] = "签到成功"
+		// Record the claim in the Beijing-window ledger so a scheduled pass in
+		// the same window does not re-POST while upstream status still shows
+		// CLAIMABLE (campaign_window.go).
+		rememberCampaignClaim(f.ID, res, time.Now())
 		// Refresh the credits snapshot so the panel shows the post-checkin
 		// balance immediately (check-in grants new credits). Best-effort:
 		// a failure here must not flip the check-in result to error.

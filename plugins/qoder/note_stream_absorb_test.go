@@ -58,6 +58,15 @@ func TestDisplayNoteWithPrev(t *testing.T) {
 }
 
 func TestSyncAuthNotePreservesCreditsOnNilCr(t *testing.T) {
+	// -count>1 safety: the lifecycle change-guard is process memory, so a
+	// previous iteration would suppress the persist this test expects. Clear
+	// only this test's keys (and restore a clean slate afterwards).
+	lifecycleState.Delete("auth-1")
+	lifecycleState.Delete("auth-1b")
+	defer func() {
+		lifecycleState.Delete("auth-1")
+		lifecycleState.Delete("auth-1b")
+	}()
 	var persisted [][]byte
 	origGet, origPersist := hostAuthGetPhysicalFn, hostAuthPersistMigrateFn
 	hostAuthGetPhysicalFn = func(authIndex string) (*hostAuthPhysical, error) {

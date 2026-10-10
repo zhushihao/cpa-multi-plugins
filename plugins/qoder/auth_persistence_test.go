@@ -115,9 +115,30 @@ func TestQoderRuntimeMetadataClassifiesOAuth(t *testing.T) {
 	if md := toAuthData(sa).Metadata; md["auth_kind"] != "oauth" {
 		t.Fatalf("runtime OAuth classification missing: %v", md["auth_kind"])
 	}
-	raw, err := buildAuthFileJSON(sa, true, "keep note", nil)
+	raw, err := buildAuthFileJSON(sa, true, "keep note", nil, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// fork fix (世豪 2026-10-10 授权): unknown top-level fields survive rewrites.
+	preserve := []byte(`{"priority":10,"weight":3,"type":"qoder","note":"old","auth":{},"model_cache":{"stale":true}}`)
+	rawKeep, errKeep := buildAuthFileJSON(sa, true, "keep note", nil, preserve)
+	if errKeep != nil {
+		t.Fatal(errKeep)
+	}
+	var kept map[string]any
+	if err := json.Unmarshal(rawKeep, &kept); err != nil {
+		t.Fatal(err)
+	}
+	if kept["priority"] != float64(10) || kept["weight"] != float64(3) {
+		t.Fatalf("preserve lost custom keys: priority=%v weight=%v", kept["priority"], kept["weight"])
+	}
+	// model_cache is maintained by models_persist outside this rebuild; the
+	// rewrite must carry it forward from the physical file instead of dropping it.
+	if kept["model_cache"] == nil {
+		t.Fatal("preserve must carry forward model_cache")
+	}
+	if kept["note"] != "keep note" || kept["disabled"] != true || kept["auth_kind"] != "oauth" {
+		t.Fatalf("managed keys must not come from preserve: note=%v disabled=%v auth_kind=%v", kept["note"], kept["disabled"], kept["auth_kind"])
 	}
 	var doc map[string]any
 	if err := json.Unmarshal(raw, &doc); err != nil {

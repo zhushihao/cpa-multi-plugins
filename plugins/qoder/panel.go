@@ -13,22 +13,23 @@ import (
 
 // wbAccount is one row of the dashboard.
 type wbAccount struct {
-	AuthIndex string           `json:"auth_index"`
-	AuthID    string           `json:"auth_id,omitempty"`
-	Name      string           `json:"name"`
-	Label     string           `json:"label"`
-	Nickname  string           `json:"nickname"`
-	UID       string           `json:"uid"`
-	Region    string           `json:"region"` // "cn" or "global"
-	Plan      string           `json:"plan"`
-	Status    string           `json:"status"`
-	Disabled  bool             `json:"disabled"`
-	Exhausted bool             `json:"exhausted"`
-	Selected  bool             `json:"selected"` // panel active routing card
-	Credits   *creditsSummary  `json:"credits,omitempty"`
-	Checkin   *checkinSummary  `json:"checkin,omitempty"`
-	Cooling   []map[string]any `json:"cooling,omitempty"`
-	Error     string           `json:"error,omitempty"`
+	AuthIndex     string             `json:"auth_index"`
+	AuthID        string             `json:"auth_id,omitempty"`
+	Name          string             `json:"name"`
+	Label         string             `json:"label"`
+	Nickname      string             `json:"nickname"`
+	UID           string             `json:"uid"`
+	Region        string             `json:"region"` // "cn" or "global"
+	Plan          string             `json:"plan"`
+	Status        string             `json:"status"`
+	Disabled      bool               `json:"disabled"`
+	Exhausted     bool               `json:"exhausted"`
+	Selected      bool               `json:"selected"` // panel active routing card
+	Credits       *creditsSummary    `json:"credits,omitempty"`
+	Checkin       *checkinSummary    `json:"checkin,omitempty"`
+	CampaignClaim *campaignClaimView `json:"campaign_claim,omitempty"` // local ledger projection (I2): pending_credit / unconfirmed / confirmed
+	Cooling       []map[string]any   `json:"cooling,omitempty"`
+	Error         string             `json:"error,omitempty"`
 }
 
 // credits/checkin/plan fields are left empty — the panel renders skeletons
@@ -98,6 +99,9 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 			acct.Region = authRegion(sa)
 			// v0.8.18: per-(account, model) cooldown rows for the panel.
 			acct.Cooling = cooldownSnapshotFor(f.ID)
+			// Local campaign-claim evidence (pending_credit / 待核 / confirmed)
+			// from this process's ledger — read-only, no upstream call (I2).
+			acct.CampaignClaim = campaignClaimViewFor(f.ID)
 			if fetchCredits {
 				plan, ci, cr, errs := cachedAccountDetails(f.ID, sa, force)
 				acct.Plan = plan
@@ -181,9 +185,12 @@ func buildDashboardEx(force, fetchCredits bool) map[string]any {
 		"active_auth":    activeID,
 		"checkin_auto":   auto,
 		"lifecycle_auto": lifecycleEnabled(),
-		"schedule":       []string{"09:00", "21:00"},
-		"server_time":    time.Now().Format("2006-01-02 15:04:05"),
-		"summary":        sum,
+		// Beijing wall-clock campaign slots (campaign_window.go); the field
+		// used to echo the removed host-local 09:00/21:00 cadence.
+		"schedule":    []string{"10:05", "10:35", "21:05"},
+		"schedule_tz": "Asia/Shanghai (UTC+8)",
+		"server_time": time.Now().Format("2006-01-02 15:04:05"),
+		"summary":     sum,
 	}
 	if len(life) > 0 {
 		resp["lifecycle"] = life

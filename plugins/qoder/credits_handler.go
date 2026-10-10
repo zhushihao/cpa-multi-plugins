@@ -35,7 +35,7 @@ func handleImportPAT(req pluginapi.ManagementRequest) map[string]any {
 	ui, _ := fetchUserInfo(tok.Token, loadedLoginRegion()) // best-effort
 	sa := buildStoredAuthFromJobToken(pat, tok, ui, loadedLoginRegion())
 
-	fileJSON, err := buildAuthFileJSON(sa, false, displayNote(sa, nil, false), nil)
+	fileJSON, err := buildAuthFileJSON(sa, false, displayNote(sa, nil, false), nil, nil)
 	if err != nil {
 		return map[string]any{"success": false, "error": err.Error()}
 	}
@@ -161,6 +161,11 @@ func handleCreditsQuery(req pluginapi.ManagementRequest) map[string]any {
 				"label":      f.Label,
 				"disabled":   f.Disabled,
 				"selected":   getActiveAuthID() == f.ID,
+			}
+			// Local campaign-claim evidence (pending_credit / 待核 / confirmed),
+			// same projection as the dashboard row (I2).
+			if v := campaignClaimViewFor(f.ID); v != nil {
+				acct["campaign_claim"] = v
 			}
 			if err != nil {
 				acct["error"] = err.Error()

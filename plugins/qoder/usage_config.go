@@ -14,12 +14,14 @@ import (
 	"time"
 )
 
-// check-in schedule: 10:00 and 21:00 local time.
-// 10 replaces 9: the CN daily check-in activity opens at 10:00 local
-// (hope0719/qoder-check-in README, 2026-09-18~09-30 activity — "每天
-// 10:00 起可领 100 Credits"); a 09:00 tick hits "活动未开始" and fails.
-// 21 stays as the evening retry/keepalive companion.
-var checkinHours = []int{10, 21}
+// Campaign claim schedule lives in campaign_window.go as Beijing wall-clock
+// slots (10:05 / 10:35 / 21:05, Asia/Shanghai). The upstream activity opens at
+// 10:00 China time (hope0719/qoder-check-in README, 2026-09-18~09-30 activity —
+// "每天 10:00 起可领 100 Credits"): 10:05 is the first attempt after the gate,
+// 10:35 the bounded recovery slot and 21:05 the evening companion. The old
+// host-local checkinHours=[10,21] was removed — a host in another timezone
+// fired hours off the real window, and 10:00 sharp raced the activity gate.
+// The scheduler additionally runs one startup catch-up per window.
 
 // plugin-level config decoded from plugin.register/reconfigure config_yaml.
 var (

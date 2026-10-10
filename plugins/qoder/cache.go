@@ -149,6 +149,28 @@ func cachedAccountDetails(authID string, sa *storedAuth, force bool) (plan strin
 // accountCacheSoftCap limits concurrent cache entries (auth churn / index thrash).
 const accountCacheSoftCap = 256
 
+// storeCreditsSnapshot merges one fresh credits snapshot into the account
+// cache entry for authID (creating one when absent), preserving plan, checkin
+// and the lifecycle grace stamp. Used by the delayed campaign credit re-check
+// so a late-observed grant reaches the panel without a second upstream call
+// (I2: quota refresh must update the cache).
+func storeCreditsSnapshot(authID string, cr *creditsSummary) {
+	if authID == "" || cr == nil {
+		return
+	}
+	now := time.Now()
+	cr.FetchedAt = now.UTC().Format(time.RFC3339)
+	entry := &accountCacheEntry{credits: cr, fetched: now}
+	if v, ok := accountCache.Load(authID); ok {
+		if prev, ok2 := v.(*accountCacheEntry); ok2 {
+			entry.checkin = prev.checkin
+			entry.plan = prev.plan
+			entry.checkinAt = prev.checkinAt
+		}
+	}
+	accountCache.Store(authID, entry)
+}
+
 // pruneAccountCacheSoftCap drops excess entries with the oldest fetched time.
 // Called after Store; O(n) over map size — fine for dozens of accounts.
 func pruneAccountCacheSoftCap(capN int) {
