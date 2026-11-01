@@ -49,6 +49,9 @@ func handleUsage(raw []byte) ([]byte, error) {
 	// summary in the host's local credential management (note field). Async —
 	// the host's usage pump must never block on note-write RPCs.
 	usageLedgerObserve(record.AuthIndex, record.AuthID, detail.TotalTokens, record.Failed, started)
+	// weighted-mode cost ledger: token-volume observation (credit unknown via
+	// the canonical path — see cost_observe.go for the host limitation).
+	wbObserveUsageDetail(record.AuthID, record.Model, detail.TotalTokens, record.Failed)
 	go usageNoteRefreshSoon(record.AuthIndex, record.AuthID)
 	forwardUsageToCPAMP(
 		record.Alias,

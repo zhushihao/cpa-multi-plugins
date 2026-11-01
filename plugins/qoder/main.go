@@ -300,6 +300,17 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleSchedulerPick(request)
 	case pluginabi.MethodUsageHandle:
 		return handleUsage(request)
+	case methodQuotaIdentifier:
+		// QuotaProvider capability (host v7.3.11): the host probes this at
+		// registration (rpc_client.go:146) and matches the identifier against
+		// auth.Provider when routing quota.fetch/reset.
+		return okEnvelope(identifierResponse{Identifier: providerName})
+	case methodQuotaDescribe:
+		return handleQuotaDescribe(request)
+	case methodQuotaFetch:
+		return handleQuotaFetch(request)
+	case methodQuotaReset:
+		return handleQuotaReset(request)
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -353,6 +364,10 @@ type registrationCapability struct {
 	Scheduler             bool                         `json:"scheduler"`
 	ManagementAPI         bool                         `json:"management_api"`
 	UsagePlugin           bool                         `json:"usage_plugin"`
+	// QuotaProvider declares the quota.* RPC surface (quota_provider.go);
+	// registerRPCPlugin flips the host's RegisteredPluginInfo.SupportsQuota
+	// on this flag (internal/pluginhost/snapshot.go).
+	QuotaProvider bool `json:"quota_provider"`
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
@@ -398,6 +413,7 @@ func wbRegistration() registration {
 			ManagementAPI:         true,
 			Scheduler:             true,
 			UsagePlugin:           true,
+			QuotaProvider:         true,
 		},
 	}
 }

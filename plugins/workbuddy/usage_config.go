@@ -121,6 +121,7 @@ func configure(raw []byte) {
 	nextStreamHeadTimeout := 0      // default off: 0 seconds
 	nextAccountMaxConcurrent := 0   // default off: admission control disabled
 	nextReserveCredits := int64(0)  // default off: guardrail disabled (#61)
+	nextExpiringSoon := defaultExpiringSoonWindow // weighted pool soon-expiring window
 	nextDailyCreditsCap := int64(0) // default off: guardrail disabled (#61)
 	nextIdentitySwitchOn := false   // default off: 429 lane switch disabled (#59)
 
@@ -161,8 +162,16 @@ func configure(raw []byte) {
 				if v, present := m["token_keepalive"]; present {
 					nextKeepaliveAuto = configScalarBool(v)
 				}
-				if v, present := m["scheduler_mode"]; present && configScalarString(v) == schedulerModeCredits {
-					nextSchedulerMode = schedulerModeCredits
+				if v, present := m["scheduler_mode"]; present {
+					switch configScalarString(v) {
+					case schedulerModeCredits:
+						nextSchedulerMode = schedulerModeCredits
+					case schedulerModeWeighted:
+						nextSchedulerMode = schedulerModeWeighted
+					}
+				}
+				if v, present := m["expiring_soon"]; present {
+					nextExpiringSoon = wbParseExpiringSoonDuration(configScalarString(v))
 				}
 				if v, present := m["usage_report_url"]; present {
 					cfgURL = configScalarString(v)
@@ -345,6 +354,21 @@ func configure(raw []byte) {
 	schedulerModeMu.Lock()
 	schedulerMode = nextSchedulerMode
 	schedulerModeMu.Unlock()
+
+	setExpiringSoonWindow(nextExpiringSoon)
+
+	// state_file may also arrive as a raw scalar line (legacy branch); apply once here.
+	if strings.Contains(string(raw), "state_file:") {
+		for _, line := range strings.Split(string(raw), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "state_file:") {
+				wbApplyCostStateConfig(strings.Trim(strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "state_file:")), "\"'"))
+				break
+			}
+		}
+	}
+
+	// Backstop state flush + sticky GC janitor (idempotent) for weighted mode.
+	ensureWbRouterJanitor()
 
 	keepaliveAutoMu.Lock()
 	keepaliveAuto = nextKeepaliveAuto

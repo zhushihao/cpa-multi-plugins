@@ -38,6 +38,11 @@ type creditsSummary struct {
 	TotalSize int64 `json:"total_size"`
 	// PackCount is number of resource packages included in the aggregate.
 	PackCount int `json:"pack_count"`
+	// TotalExpiring is the subset of TotalRemain whose package cycle ends
+	// within the configured soon-expiring window (expiring_credits.go).
+	// Derived from the same get-user-resource response — no extra upstream
+	// call. 0 with no package rows means "unknown/none", never a guarantee.
+	TotalExpiring int64 `json:"total_expiring,omitempty"`
 	// FetchedAt is when this snapshot was taken (RFC3339). Upstream billing lag
 	// can make remain/used look "stuck" for minutes after chat; compare this
 	// timestamp — not only the numbers — when diagnosing frozen credits.

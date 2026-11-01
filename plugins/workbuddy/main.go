@@ -293,8 +293,23 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleManagement(request)
 	case pluginabi.MethodSchedulerPick:
 		return handleSchedulerPick(request)
+	case pluginabi.MethodRequestInterceptBefore:
+		return handleRequestInterceptBefore(request)
+	case pluginabi.MethodRequestInterceptAfter:
+		return handleRequestInterceptAfter(request)
 	case pluginabi.MethodUsageHandle:
 		return handleUsage(request)
+	case methodQuotaIdentifier:
+		// QuotaProvider capability (host v7.3.11): the host probes this at
+		// registration (rpc_client.go:146) and matches the identifier against
+		// auth.Provider when routing quota.fetch/reset.
+		return okEnvelope(identifierResponse{Identifier: providerName})
+	case methodQuotaDescribe:
+		return handleQuotaDescribe()
+	case methodQuotaFetch:
+		return handleQuotaFetch(request)
+	case methodQuotaReset:
+		return handleQuotaReset()
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -348,6 +363,14 @@ type registrationCapability struct {
 	Scheduler             bool                         `json:"scheduler"`
 	ManagementAPI         bool                         `json:"management_api"`
 	UsagePlugin           bool                         `json:"usage_plugin"`
+	// RequestInterceptor declares the intercept.before/after RPC surface
+	// (session_stick.go); the host feeds conversation headers into scheduler
+	// pick through it. QuotaProvider declares the quota.* RPC surface
+	// (quota_provider.go); registerRPCPlugin flips the host's
+	// RegisteredPluginInfo.SupportsQuota on this flag
+	// (internal/pluginhost/snapshot.go).
+	RequestInterceptor bool `json:"request_interceptor"`
+	QuotaProvider      bool `json:"quota_provider"`
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
@@ -373,7 +396,9 @@ func wbRegistration() registration {
 				{Name: "models_cn", Type: pluginapi.ConfigFieldTypeString, Description: "Leave empty (recommended): each CN account then supports exactly what copilot.tencent.com returns for its credential token (5-min cache). Optional comma-separated upstream model IDs to pin/override the CN model output."},
 				{Name: "models_global", Type: pluginapi.ConfigFieldTypeString, Description: "Leave empty (recommended): each Global account then supports exactly what workbuddy.ai returns for its credential token (5-min cache). Optional comma-separated upstream model IDs to pin/override the Global model output."},
 				{Name: "models_intl", Type: pluginapi.ConfigFieldTypeString, Description: "Leave empty (recommended): each Intl account then supports exactly what codebuddy.ai returns for its credential token (5-min cache) - no pre-filled guessing, so unsupported models are never advertised or routed. Optional comma-separated upstream model IDs to pin/override the Intl model output."},
-				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits}, Description: "Multi-account selection: off (defer to built-in, default) or credits (pick highest remaining). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set scheduler_mode=credits."},
+				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits, schedulerModeWeighted}, Description: "Multi-account selection: off (defer to built-in, default), credits (panel active-account with fallback), or weighted (cost-tier weighted pool + session stickiness, balances by remaining/expiring credits). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set scheduler_mode."},
+				{Name: "state_file", Type: pluginapi.ConfigFieldTypeString, Description: "Opt-in cost-ledger persistence path (weighted mode): plugin-owned TTL-filtered snapshot of measured per-(account,model) credit costs so cost tiers survive restarts. Empty/absent = in-memory only."},
+				{Name: "expiring_soon", Type: pluginapi.ConfigFieldTypeString, Description: "Soon-expiring credits window feeding the weighted pool's expiring factor (Go duration, e.g. 168h; default 168h, 0 disables the bucket). Derived from package cycle_end dates in the existing billing response — zero extra upstream calls."},
 				{Name: "stream_head_timeout", Type: pluginapi.ConfigFieldTypeInteger, Description: "Opt-in async-stream head gate, in seconds (default 0 = disabled, unchanged behavior). When > 0 the executor waits up to this long for the first decisive upstream event before opening the host stream, so a pre-answer failure (upstream >=400 or an error frame before the model starts answering) returns as a normal failed request with an HTTP status instead of a lossy in-band text error. Never blocks longer than this, and a silent stream is released normally."},
 				{Name: "account_max_concurrent", Type: pluginapi.ConfigFieldTypeInteger, Description: "Opt-in per-credential in-flight chat cap (default 0 = disabled, unchanged dispatch). N > 0: once N executor calls for one credential are still in flight, further requests fail fast with a plain error so the host rotates to another candidate — no local queueing. The upstream meters per (account, minute) and one big-context conversation alone carries hundreds of thousands of tokens, so parallel conversations on one credential are the fastest path to a model-scoped rate limit."},
 				{Name: "reserve_credits", Type: pluginapi.ConfigFieldTypeInteger, Description: "Opt-in credit guardrail (#61): skip a credential in scheduler pick once its cached remaining credits are <= the reserve, keeping the account usable for the official client. Default 0 = off. Reads the existing credits cache only (zero upstream calls). Only effective with scheduler_mode: credits; per-credential override: reserve_credits number in the auth document top level (0 = disable for that credential)."},
@@ -393,6 +418,8 @@ func wbRegistration() registration {
 			ManagementAPI:         true,
 			Scheduler:             true,
 			UsagePlugin:           true,
+			RequestInterceptor:    true,
+			QuotaProvider:         true,
 		},
 	}
 }

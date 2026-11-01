@@ -775,12 +775,15 @@ func fetchUserResource(sa *storedAuth) (*creditsSummary, error) {
 	// result (no packs yet) never enters the fallback.
 	if len(resp.Response.Data.Accounts) == 0 && isEnterpriseAccount(sa) {
 		if u, uerr := fetchEnterpriseUsage(sa); uerr == nil {
-			return u.creditsSummary(), nil
+			summary := u.creditsSummary()
+			summary.TotalExpiring = wbClampExpiring(summary.TotalRemain, wbExpiringSoonRemain(summary.Packages, now, loadedExpiringSoonWindow()))
+			return summary, nil
 		}
 		// Both planes came back empty: report unknown (nil) rather than a
 		// zero summary — "no data" must not render as "exhausted".
 		return nil, fmt.Errorf("enterprise account: personal meter empty and enterprise usage unavailable")
 	}
+	sum.TotalExpiring = wbClampExpiring(sum.TotalRemain, wbExpiringSoonRemain(sum.Packages, now, loadedExpiringSoonWindow()))
 	return sum, nil
 }
 
