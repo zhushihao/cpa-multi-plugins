@@ -6,6 +6,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -59,11 +61,17 @@ func handleImportAuth(req pluginapi.ManagementRequest) map[string]any {
 		return map[string]any{"success": false, "error": err.Error()}
 	}
 	// Persist nested storage + top-level type/note/logo/disabled for Auth page.
-	fileJSON, err := buildAuthFileJSON(sa, false, displayNote(sa, nil, false), nil)
+	// Round6: an explicit top-level priority in the imported payload is
+	// carried into the saved file (the management-surface acceptance hook),
+	// and an existing on-disk priority/model_cache for the same credential is
+	// preserved when the payload omits it (preservePluginDocKeys, same
+	// read-before-overwrite rule as the hostAuthSaveJSON funnel).
+	fileJSON, err := buildImportAuthFileJSON(sa, raw)
 	if err != nil {
 		return map[string]any{"success": false, "error": err.Error()}
 	}
 	auth := toAuthData(sa)
+	fileJSON = preservePluginDocKeys(auth.FileName, fileJSON)
 	saveReq := pluginapi.HostAuthSaveRequest{
 		Name: auth.FileName,
 		JSON: fileJSON,
@@ -83,25 +91,52 @@ func handleImportAuth(req pluginapi.ManagementRequest) map[string]any {
 	}
 	var saveResp pluginapi.HostAuthSaveResponse
 	_ = json.Unmarshal(env.Result, &saveResp)
-	// Remove legacy workbuddy.json if it exists and differs from the saved name.
+	// Deliberate import revival (round-3 P0, fail-closed order): a confirmed
+	// host.auth.save response is not by itself proof that the canonical file
+	// exists on disk with the right identity, so the removal record is cleared
+	// ONLY after a read-back verification. Otherwise the identity stays blocked
+	// and the reason is reported explicitly.
+	tombstoneCleared, revivalReason := wbClearTombstoneAfterVerifiedCanonicalWrite(sa)
+	if !tombstoneCleared && revivalReason != "" {
+		log.Printf("workbuddy: import saved %s but %s", saveResp.Name, revivalReason)
+	}
+	// Round-2 review (I6 preservation-first): the previous A-35 cleanup DELETED
+	// a sibling legacy workbuddy.json after the save. Old credential files are
+	// rollback material (:3002 may still read them) and are never removed
+	// automatically — report it instead, operator retires it after cutover.
 	if saveResp.Name != "" && !strings.EqualFold(saveResp.Name, authFileName) {
-		legacyPath := strings.TrimSpace(saveResp.Path)
-		// Best-effort: if auth dir is known via saveResp.Path parent, try removing sibling workbuddy.json.
-		if legacyPath != "" {
-			dir := filepath.Dir(legacyPath)
-			legacyFile := filepath.Join(dir, authFileName)
-			// A-35: use deleteAuthFileInDir for absolute path + directory confinement.
-			_ = deleteAuthFileInDir(legacyFile, dir)
+		if legacyPath := strings.TrimSpace(saveResp.Path); legacyPath != "" {
+			legacyFile := filepath.Join(filepath.Dir(legacyPath), authFileName)
+			if _, statErr := os.Stat(legacyFile); statErr == nil {
+				log.Printf("workbuddy: import saved %s; legacy dual-named copy %s preserved in place (I6)", saveResp.Name, legacyFile)
+			}
 		}
 	}
-	return map[string]any{
-		"success":  true,
-		"name":     saveResp.Name,
-		"path":     saveResp.Path,
-		"uid":      sa.Account.UID,
-		"nickname": sa.Account.Nickname,
-		"file":     auth.FileName,
+	resp := map[string]any{
+		"success":           true,
+		"name":              saveResp.Name,
+		"path":              saveResp.Path,
+		"uid":               sa.Account.UID,
+		"nickname":          sa.Account.Nickname,
+		"file":              auth.FileName,
+		"tombstone_cleared": tombstoneCleared,
 	}
+	if revivalReason != "" {
+		resp["tombstone_blocked_reason"] = revivalReason
+	}
+	return resp
+}
+
+// buildImportAuthFileJSON builds the persisted document for one import
+// payload: the canonical typed rebuild plus an explicit top-level priority
+// when the payload carries one (number or numeric string), using
+// buildAuthFileJSON's existing extra merge — no new management API.
+func buildImportAuthFileJSON(sa *storedAuth, payload []byte) ([]byte, error) {
+	var extra map[string]any
+	if p, ok := priorityFromJSON(payload); ok {
+		extra = map[string]any{priorityDocKey: p}
+	}
+	return buildAuthFileJSON(sa, false, displayNote(sa, nil, false), extra)
 }
 
 func handleCheckinConfig(req pluginapi.ManagementRequest) map[string]any {

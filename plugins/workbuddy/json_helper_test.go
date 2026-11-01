@@ -69,34 +69,30 @@ func TestJsonStr(t *testing.T) {
 	}
 }
 func TestNextCheckinTime(t *testing.T) {
-	// 08:00 → next 09:00
-	morning := time.Date(2026, 7, 24, 8, 0, 0, 0, time.UTC)
-	got := nextCheckinTime(morning)
-	if got.Hour() != 9 {
-		t.Fatalf("want 9, got %v", got.Hour())
-	}
-	// 10:00 → next 21:00
-	noon := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
-	got = nextCheckinTime(noon)
-	if got.Hour() != 21 {
-		t.Fatalf("want 21, got %v", got.Hour())
-	}
-	// 22:00 → next 23:00 (v0.9.24 night-task slot for black_cat, same day)
+	// I6 schedule ruling (2026-09-30): single midnight check-in slot 00:00 +
+	// random 5–15 min → window 00:05–00:15 CST. The window is asserted on
+	// wbNextCheckinInstant DIRECTLY (the raw check-in planner); nextCheckinTime
+	// is the full scheduler wake (check-in ∪ keepalive  travel) and is
+	// asserted separately (TestNextCheckinTimeWakesAtTravelSlot).
+	withAutoTravelDisabled(t)
+	// production default: midnight slot, jitter live
 	late := time.Date(2026, 7, 24, 22, 0, 0, 0, time.UTC)
-	got = nextCheckinTime(late)
-	if got.Hour() != 23 {
-		t.Fatalf("want 23 (night slot), got %v", got.Hour())
+	for i := 0; i < 50; i++ {
+		j := wbNextCheckinInstant(late, 0)
+		if j.Day() != 25 || j.Hour() != 0 || j.Minute() < 5 || j.Minute() > 14 {
+			t.Fatalf("want 25th 00:05–00:14, got %v", j)
+		}
 	}
-	if got.Day() != 24 {
-		t.Fatalf("want same day, got %v", got.Day())
+	// window passed (00:20) → tomorrow's window
+	passed := time.Date(2026, 7, 24, 0, 20, 0, 0, time.UTC)
+	j := wbNextCheckinInstant(passed, 0)
+	if j.Day() != 25 || j.Hour() != 0 || j.Minute() < 5 || j.Minute() > 14 {
+		t.Fatalf("want 25th 00:05–00:14, got %v", j)
 	}
-	// 23:30 → next day 09:00 (night slot passed; nothing before morning)
-	after := time.Date(2026, 7, 24, 23, 30, 0, 0, time.UTC)
-	got = nextCheckinTime(after)
-	if got.Hour() != 9 {
-		t.Fatalf("want 9, got %v", got.Hour())
-	}
-	if got.Day() != 25 {
-		t.Fatalf("want next day, got %v", got.Day())
+	// pinned jitter → exact instants; legacy hour-table pinning still works
+	withCheckinHours(t, 9)
+	morning := time.Date(2026, 7, 24, 8, 0, 0, 0, time.UTC)
+	if got := wbNextCheckinInstant(morning, 9); got.Hour() != 9 || got.Minute() != 0 {
+		t.Fatalf("want exact 09:00, got %v", got)
 	}
 }

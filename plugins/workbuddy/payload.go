@@ -62,6 +62,13 @@ func prepareUpstreamBody(payload, original []byte, sa *storedAuth, upstreamModel
 	// 5. rewriteModel: swap client model name to upstream model id.
 	rewriteModelInPlace(obj, upstreamModel)
 
+	// 5.5 clampReasoningEffort: the resolved upstream model rejects an
+	// unsupported reasoning_effort (code 11150, live 2026-09-30) — clamp to
+	// the nearest supported level. Runs AFTER forceMaxThinking (step 3), so
+	// the hy3/hy4 pin semantics and the hy3/hy3-x low-keep stay intact (their
+	// forced/kept values are inside the supported sets).
+	clampReasoningEffortInPlace(obj, upstreamModel)
+
 	// 6. maxTokenRename: OpenAI-newer clients send max_completion_tokens;
 	// the CodeBuddy upstream speaks max_tokens. Copy the value across when
 	// max_tokens is absent, then drop the foreign key so the gateway does
@@ -349,6 +356,110 @@ func mirrorReasoningEffort(obj map[string]any) bool {
 	return false
 }
 
+// wbReasoningEffortRanks is the ascending rank of the reasoning-effort dials
+// seen in the wild (OpenAI-style minimal/low/medium/high plus this roster's
+// xhigh/max tiers). A model's supported set below is a subset of these keys;
+// ranks exist only so an unsupported request can be clamped to the nearest
+// supported level.
+var wbReasoningEffortRanks = map[string]int{
+	"minimal": 0,
+	"low":     1,
+	"medium":  2,
+	"high":    3,
+	"xhigh":   4,
+	"max":     5,
+}
+
+// wbModelReasoningEfforts is the per-upstream-model supported effort set
+// (2026-09-30 live upstream roster, from the 11150 rejections): a value
+// outside the model's set is rejected upstream, so the payload path clamps
+// instead of forwarding it.
+var wbModelReasoningEfforts = map[string][]string{
+	"deepseek-v4.1-flash": {"low", "high", "max"},
+	"glm-5.3":             {"low", "high", "max"},
+	"glm-5.3-flash":       {"low", "high", "max"},
+	"kimi-k3-2":           {"low", "high", "xhigh"},
+	"kimi-k2.8-preview":   {"low", "high", "max"},
+	"hy4-preview":         {"high"},
+	"hy3":                 {"low", "high"},
+	"hy3-x":               {"low", "high"},
+}
+
+// clampReasoningEffortForModel returns the reasoning_effort value to send
+// upstream for one resolved upstream model. Order of preference:
+//
+//  1. exact support (case-insensitive) → the normalized level, unchanged;
+//  2. a request whose rank exceeds the model's top supported tier clamps to
+//     that top tier (owner correction 2026-09-30: kimi-k3-2 "max" → "xhigh",
+//     never a silent downgrade to "high");
+//  3. nearest by rank (low<high<xhigh<max, with the wider minimal/medium
+//     dialects placed between) — equidistant requests prefer the HIGHER
+//     supported tier (never silently downgrade thinking);
+//  4. low is the floor — a request below every supported level lands on the
+//     lowest supported one.
+//
+// Unknown dials, empty values and unknown models pass through unchanged: the
+// clamp never invents an effort level the client did not ask for (mirrors the
+// "do not invent" boundary of mirrorReasoningEffort). Matching is
+// case-insensitive because this runs on the client-facing body after model
+// resolution.
+func clampReasoningEffortForModel(model, effort string) string {
+	set, ok := wbModelReasoningEfforts[strings.ToLower(strings.TrimSpace(model))]
+	if !ok || len(set) == 0 {
+		return effort
+	}
+	e := strings.ToLower(strings.TrimSpace(effort))
+	for _, name := range set {
+		if name == e {
+			return e
+		}
+	}
+	reqRank, ranked := wbReasoningEffortRanks[e]
+	if !ranked {
+		return effort // unknown dial: leave as-is, never invent
+	}
+	// Above-top clamp: a request ranked higher than every supported level
+	// lands on the set's top tier (kimi-k3-2 low/high/xhigh + "max" → "xhigh").
+	top, topRank := set[0], wbReasoningEffortRanks[set[0]]
+	for _, name := range set[1:] {
+		if rank := wbReasoningEffortRanks[name]; rank > topRank {
+			top, topRank = name, rank
+		}
+	}
+	if reqRank > topRank {
+		return top
+	}
+	best := ""
+	bestDist, bestRank := 0, 0
+	for _, name := range set {
+		rank := wbReasoningEffortRanks[name]
+		dist := rank - reqRank
+		if dist < 0 {
+			dist = -dist
+		}
+		if best == "" || dist < bestDist || (dist == bestDist && rank > bestRank) {
+			best, bestDist, bestRank = name, dist, rank
+		}
+	}
+	return best
+}
+
+// clampReasoningEffortInPlace applies clampReasoningEffortForModel to
+// obj["reasoning_effort"]. Absent/non-string fields are left alone; returns
+// true when the field value changed.
+func clampReasoningEffortInPlace(obj map[string]any, upstreamModel string) bool {
+	cur, ok := obj["reasoning_effort"].(string)
+	if !ok {
+		return false
+	}
+	next := clampReasoningEffortForModel(upstreamModel, cur)
+	if next == "" || next == cur {
+		return false
+	}
+	obj["reasoning_effort"] = next
+	return true
+}
+
 // compactToolDescriptions strips tool.function.description when the serialized
 // tools array exceeds toolDescriptionByteLimit (64KB). Tencent's body-size
 // filter rejects large tool descriptions. Mirrors OmniRoute codebuddy-cn.ts.
@@ -417,13 +528,18 @@ func injectReasoningInPlace(obj map[string]any) bool {
 }
 
 // reasoningTextFromMessage returns the first non-empty reasoning text carried
-// on a message, from either reasoning_content or reasoning fields.
+// on a message, from either reasoning_content or reasoning fields. The host's
+// responses→chat fallback fills lost turns with the literal "[reasoning
+// unavailable]" (openai_openai-responses_request.go fallbackToolReasoning);
+// folding that into a <thought> block feeds the model a bracketed token it
+// will parrot back as new thinking (observed live 2026-09-30), so it is
+// treated as absent here.
 func reasoningTextFromMessage(msg map[string]any) string {
-	if rc, ok := msg["reasoning_content"].(string); ok && strings.TrimSpace(rc) != "" {
-		return strings.TrimSpace(rc)
-	}
-	if r, ok := msg["reasoning"].(string); ok && strings.TrimSpace(r) != "" {
-		return strings.TrimSpace(r)
+	for _, key := range []string{"reasoning_content", "reasoning"} {
+		if rc, ok := msg[key].(string); ok && strings.TrimSpace(rc) != "" &&
+			strings.TrimSpace(rc) != "[reasoning unavailable]" {
+			return strings.TrimSpace(rc)
+		}
 	}
 	return ""
 }

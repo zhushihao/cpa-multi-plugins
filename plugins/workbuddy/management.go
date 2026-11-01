@@ -43,6 +43,11 @@ type creditsSummary struct {
 	// timestamp — not only the numbers — when diagnosing frozen credits.
 	FetchedAt string           `json:"fetched_at,omitempty"`
 	Packages  []packageSummary `json:"packages"`
+	// TotalExpiring is the subset of TotalRemain whose package cycle ends
+	// within the configured expiring_soon window (soon-expiring bonus credits).
+	// Subset of TotalRemain, clamped; 0 when the window is disabled or no
+	// package end time is known. Feeds the weighted pool's expiring factor.
+	TotalExpiring int64 `json:"total_expiring,omitempty"`
 }
 
 type packageSummary struct {

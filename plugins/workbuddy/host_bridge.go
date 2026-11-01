@@ -100,7 +100,7 @@ func hostBridgeUnwrap(raw []byte, method string) (json.RawMessage, error) {
 // hostBridgeAvailable reports whether host.http.* RPC is wired up. False in
 // unit tests (no hostAPI) and when the host binary predates the bridge.
 func hostBridgeAvailable() bool {
-	return hostAPI != nil && hostAPI.call != nil
+	return hostCallAvailable()
 }
 
 // hostHTTPDo performs a non-streaming upstream call via the host's http bridge.
@@ -112,7 +112,15 @@ func hostBridgeAvailable() bool {
 // v7.2.x without the http bridge), we route through sharedHTTPClient directly.
 // This keeps the plugin functional in dev/test contexts while preferring the
 // compliant path in production.
+// hostHTTPDoFn is the seam for the non-streaming host http bridge; tests and
+// the quota bootstrap retry replace it to bypass or simulate the bridge.
+var hostHTTPDoFn = hostHTTPDoImpl
+
 func hostHTTPDo(req *http.Request) (*hostHTTPResponse, error) {
+	return hostHTTPDoFn(req)
+}
+
+func hostHTTPDoImpl(req *http.Request) (*hostHTTPResponse, error) {
 	if req == nil {
 		return nil, fmt.Errorf("nil request")
 	}

@@ -213,14 +213,30 @@ func samePersistedModels(a, b []pluginapi.ModelInfo) bool {
 	return bytes.Equal(aj, bj)
 }
 
-// preservePluginDocKeys re-injects whitelisted plugin-stamped keys that the
+// pluginPreservedDocKeys are the top-level keys the save funnel re-injects
+// when an incoming document is missing them but the current physical file
+// carries them. Keys the caller explicitly set always win over the persisted
+// copy.
+//
+//   - model_cache: plugin-stamped discovery snapshot (v0.9.41) — a typed
+//     buildAuthFileJSON rebuild (lifecycle notes, adopt, import) constructs a
+//     fresh document and would otherwise silently drop it, and the next
+//     discovery outage then advertised nothing.
+//   - priority: externally managed routing tier (CPA panel, CPA-Manager-Plus
+//     batch priority, hand edits). The plugin owns neither the value nor its
+//     semantics — it only has to keep it alive across its own rewrites. The
+//     host's plugin-auth branch does not read this key from the file (only
+//     the non-plugin synthesizer path does), so losing it silently resets the
+//     credential to the default routing tier (round6: shawn-primary /
+//     anyu-fallback reverted to balanced pooling).
+var pluginPreservedDocKeys = []string{modelCacheDocKey, priorityDocKey}
+
+// preservePluginDocKeys re-injects the plugin-preserved keys that the
 // incoming document is missing but the current physical file carries (called
-// from the hostAuthSaveJSON funnel). The typed buildAuthFileJSON rebuilds —
-// lifecycle notes, adopt, import — construct a fresh document from a struct
-// and otherwise silently drop the v0.9.38 model_cache snapshot: every
-// credits-note churn wiped it, and the next discovery outage then advertised
-// nothing until the next successful discovery. Keys the caller explicitly
-// set always win over the persisted copy.
+// from the hostAuthSaveJSON funnel; read before overwrite). The typed
+// buildAuthFileJSON rebuilds — lifecycle notes, adopt, import — construct a
+// fresh document from a struct and otherwise silently drop both the v0.9.38
+// model_cache snapshot and the externally managed priority.
 func preservePluginDocKeys(name string, doc []byte) []byte {
 	if len(doc) == 0 || name == "" {
 		return doc
@@ -229,7 +245,13 @@ func preservePluginDocKeys(name string, doc []byte) []byte {
 	if err := json.Unmarshal(doc, &have); err != nil {
 		return doc
 	}
-	if _, ok := have[modelCacheDocKey]; ok {
+	var missing []string
+	for _, key := range pluginPreservedDocKeys {
+		if _, ok := have[key]; !ok {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) == 0 {
 		return doc
 	}
 	physical := physicalDocByName(name)
@@ -240,11 +262,16 @@ func preservePluginDocKeys(name string, doc []byte) []byte {
 	if err := json.Unmarshal(physical, &prev); err != nil {
 		return doc
 	}
-	raw, ok := prev[modelCacheDocKey]
-	if !ok || len(raw) == 0 {
+	changed := false
+	for _, key := range missing {
+		if raw, ok := prev[key]; ok && len(raw) > 0 {
+			have[key] = raw
+			changed = true
+		}
+	}
+	if !changed {
 		return doc
 	}
-	have[modelCacheDocKey] = raw
 	merged, err := json.Marshal(have)
 	if err != nil {
 		return doc

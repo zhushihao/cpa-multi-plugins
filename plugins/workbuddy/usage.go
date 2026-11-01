@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,7 +71,29 @@ func handleUsage(raw []byte) ([]byte, error) {
 // CPA builds) still emit usage; hosts with the wiring will trigger HandleUsage
 // separately, but forwardUsageToCPAMP is idempotent at the CPAMP ingestion
 // layer (NDJSON import dedups on timestamp+auth+model+total_tokens).
+//
+// authID is the CPAMP attribution id (the account UID); failed attempts carry
+// no usage map, so no routing-cost identity is needed here.
 func publishUsage(requestedModel, upstreamModel, authID string, started time.Time, detail usage.Detail, failed bool, statusCode int, errBody string) {
+	publishUsageWithUsage(requestedModel, upstreamModel, authID, "", started, detail, nil, failed, statusCode, errBody)
+}
+
+// publishUsageWithUsage is publishUsage plus the raw upstream `usage` object,
+// which lets the success path record the observed credit cost for the
+// cost-tier ledger (usage.credit exists only in the raw object; the
+// canonicalized usage.Detail drops it).
+//
+// cpampAuthID and ledgerAuthID are deliberately DISTINCT identities:
+//   - cpampAuthID is the account UID the CPAMP monitoring pipeline attributes
+//     usage to (unchanged contract);
+//   - ledgerAuthID is the host auth record ID the scheduler can address, which
+//     is what the cost ledger must be keyed by (review S1). Passing "" means
+//     "no routable identity" — such an observation is skipped rather than
+//     misfiled under a UID no SchedulerPick candidate can ever match.
+func publishUsageWithUsage(requestedModel, upstreamModel, cpampAuthID, ledgerAuthID string, started time.Time, detail usage.Detail, usageMap map[string]any, failed bool, statusCode int, errBody string) {
+	if !failed && usageMap != nil {
+		wbObserveModelCost(ledgerAuthID, requestedModel, usageMap)
+	}
 	model := strings.TrimSpace(upstreamModel)
 	if model == "" {
 		model = strings.TrimSpace(requestedModel)
@@ -82,7 +105,100 @@ func publishUsage(requestedModel, upstreamModel, authID string, started time.Tim
 	// Fire-and-forget so the executor hot path never blocks on the CPAMP
 	// round-trip. handleUsage (the host-driven path) is synchronous because the
 	// host already runs it on its own goroutine after the request completes.
-	go forwardUsageToCPAMP(alias, model, authID, started, normalizeUsageDetail(detail), failed, statusCode, errBody)
+	go forwardUsageToCPAMP(alias, model, cpampAuthID, started, normalizeUsageDetail(detail), failed, statusCode, errBody)
+}
+
+// wbObserveModelCost feeds one measured (account, model) cost sample into the
+// routing pool's ledger. authID is the host auth record ID (the pool's key);
+// requestedModel is the client-requested name — the ledger canonicalizes it
+// with wbCostModelKey so the schedule-time lookup finds the row. Missing
+// identity, missing credit or non-positive token totals are "no observation",
+// never a zero-cost sample (otherwise free-tier would be asserted from an
+// absence of data).
+func wbObserveModelCost(authID, requestedModel string, usageMap map[string]any) {
+	if strings.TrimSpace(authID) == "" || strings.TrimSpace(requestedModel) == "" {
+		return
+	}
+	credit, total, ok := wbUsageCreditTotal(usageMap)
+	if !ok {
+		return
+	}
+	wbRouterPool.noteCost(authID, requestedModel, credit, total)
+}
+
+// wbUsageCreditTotal extracts usage.credit (float or numeric string) and a
+// positive total token count from an upstream usage object.
+func wbUsageCreditTotal(m map[string]any) (float64, int, bool) {
+	if len(m) == 0 {
+		return 0, 0, false
+	}
+	credit, ok := wbAnyFloat(m["credit"])
+	if !ok || credit < 0 {
+		return 0, 0, false
+	}
+	total := wbAnyInt(m["total_tokens"])
+	if total <= 0 {
+		total = wbAnyInt(m["prompt_tokens"]) + wbAnyInt(m["completion_tokens"])
+	}
+	if total <= 0 {
+		return 0, 0, false
+	}
+	return credit, total, true
+}
+
+// wbAnyFloat tolerates the numeric shapes upstream emits (float64 from
+// encoding/json, json.Number, int64, or a numeric string).
+func wbAnyFloat(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case json.Number:
+		f, err := n.Float64()
+		return f, err == nil
+	case string:
+		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
+		return f, err == nil
+	}
+	return 0, false
+}
+
+func wbAnyInt(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		i, err := n.Int64()
+		if err == nil {
+			return int(i)
+		}
+	case string:
+		i, err := strconv.Atoi(strings.TrimSpace(n))
+		if err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
+// usageMapFromCompletion extracts the raw usage object from an aggregated
+// chat.completion payload (nil when absent).
+func usageMapFromCompletion(payload []byte) map[string]any {
+	var obj map[string]any
+	if json.Unmarshal(payload, &obj) != nil {
+		return nil
+	}
+	m, _ := obj["usage"].(map[string]any)
+	return m
 }
 
 // forwardUsageToCPAMP POSTs one NDJSON line to CPAMP usage/import.

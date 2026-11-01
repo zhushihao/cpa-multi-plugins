@@ -262,8 +262,20 @@ func persistLoginCredential(sa *storedAuth) {
 		log.Printf("workbuddy: login persist (plugin-side) marshal failed: %v", err)
 		return
 	}
+	// Fail-closed revival (round-3 P0): the plugin-side save runs FIRST; the
+	// removal record is cleared only afterwards and only with a verified
+	// canonical read-back. The host's own post-poll primary save is not
+	// observable here, so a failed plugin-side save is NOT treated as a reliable
+	// revival — the identity stays blocked until a verified write (import or a
+	// later successful login). G07 boundary: not claimed as reliable.
 	if err := hostAuthPersistFn(authFileNameFor(sa), "", raw); err != nil {
-		log.Printf("workbuddy: login persist (plugin-side) failed — host save remains primary: %v", err)
+		log.Printf("workbuddy: login persist (plugin-side) failed — host save remains primary; removal record NOT cleared (fail-closed): %v", err)
+		return
+	}
+	if cleared, reason := wbClearTombstoneAfterVerifiedCanonicalWrite(sa); cleared {
+		log.Printf("workbuddy: login revival verified (%s) — removal record cleared", authFileNameFor(sa))
+	} else if reason != "" {
+		log.Printf("workbuddy: login persist wrote %s but %s", authFileNameFor(sa), reason)
 	}
 }
 

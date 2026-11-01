@@ -8,9 +8,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -56,29 +58,52 @@ func isLegacyWorkbuddyAuthName(name string) bool {
 
 // resolveAuthFileTarget picks the canonical file name + path for save/delete.
 // Prefer workbuddy-<uid>.json; if the host still points at legacy workbuddy.json
-// for a UID-bearing account, rewrite to the uid name and schedule legacy removal.
-
+// for a UID-bearing account, the caller writes the canonical name and reports
+// the legacy path. I6: the legacy file is PRESERVED by
+// hostAuthPersistMigrate (non-destructive) — the returned legacyPath is for
+// logging/observability only, never a delete target.
+//
+// Round-2 review hardening: the host-reported name is only reused when it is
+// neither a legacy workbuddy name nor a preserved legacy codebuddy-cn / intl
+// SOURCE, and when the physical document carries the SAME account identity as
+// sa. A drifted index→file mapping therefore can never redirect a write onto
+// another account's file or over a preserved source.
 func resolveAuthFileTarget(sa *storedAuth, phys *hostAuthPhysical) (name, path string, legacyPath string) {
 	name = authFileNameFor(sa)
-	if phys != nil {
-		path = strings.TrimSpace(phys.Path)
-		physName := strings.TrimSpace(phys.Name)
-		if physName != "" && !isLegacyWorkbuddyAuthName(physName) {
-			// Already on multi-account name — keep host name (should match uid form).
-			name = physName
-		}
-		if isLegacyWorkbuddyAuthName(physName) || isLegacyWorkbuddyAuthName(filepath.Base(path)) {
-			if sa != nil && strings.TrimSpace(sa.Account.UID) != "" {
-				// Migrate: write canonical, delete legacy path after save.
-				legacyPath = path
-				if isLegacyWorkbuddyAuthName(filepath.Base(path)) {
-					// path stays legacy until we write canonical beside it
-				}
-				// After persist to name, remove legacyPath if different.
-			}
+	if phys == nil {
+		return name, "", ""
+	}
+	path = strings.TrimSpace(phys.Path)
+	physName := strings.TrimSpace(phys.Name)
+	if physName != "" && physNameSafeToReuse(physName, phys.JSON, sa) {
+		// Already on multi-account name — keep host name (should match uid form).
+		name = physName
+	}
+	if isLegacyWorkbuddyAuthName(physName) || isLegacyWorkbuddyAuthName(filepath.Base(path)) {
+		if sa != nil && strings.TrimSpace(sa.Account.UID) != "" {
+			// Migrate: write the canonical name; hostAuthPersistMigrate
+			// keeps the legacy file in place (I6, 旧凭据不回写不删除).
+			legacyPath = path
 		}
 	}
 	return name, path, legacyPath
+}
+
+// physNameSafeToReuse reports whether the host-reported file name may be used as
+// the write target: it must not be a preserved legacy source (workbuddy.json /
+// codebuddy-cn-* / codebuddy-intl-*), and the physical credential must parse
+// and carry the same identity (uid × realm) as sa.
+func physNameSafeToReuse(physName string, physJSON []byte, sa *storedAuth) bool {
+	if isLegacyWorkbuddyAuthName(physName) || isLegacyCodebuddyAuthName(physName) || isLegacyCodebuddyIntlAuthName(physName) {
+		return false
+	}
+	physSA, err := parseStored(physJSON)
+	if err != nil || physSA == nil {
+		return false // unknown physical credential: fall back to the canonical name
+	}
+	want := wbAuthIdentityOf(sa).key()
+	got := wbAuthIdentityOf(physSA).key()
+	return want != "" && want == got
 }
 
 // hostAuthPersist saves via host API only. Dual-writing the physical path after
@@ -101,7 +126,9 @@ var (
 	hostAuthPersistMigrateFn = hostAuthPersistMigrate
 	// hostAuthPersistFn is the write seam for the login success path
 	// (persistLoginCredential): tests stub it to record the save instead of
-	// touching the host bridge.
+	// touching the host bridge. The non-destructive adopt path uses it too.
+	// The auth-list seam (hostAuthListFn) lives in models_persist.go and is
+	// shared by the adopt path.
 	hostAuthPersistFn = hostAuthPersist
 )
 
@@ -139,22 +166,27 @@ func hostAuthPersist(name, path string, raw []byte) error {
 	return hostAuthSaveJSON(name, raw)
 }
 
-// hostAuthPersistMigrate is like hostAuthPersist but also removes a legacy path
-// when the canonical name differs (workbuddy.json → workbuddy-<uid>.json).
-
+// hostAuthPersistMigrate persists the canonical credential document. When the
+// account was historically stored under the bare legacy name
+// (workbuddy.json), the legacy file is PRESERVED IN PLACE.
+//
+// I6 non-destructive policy: this function used to delete the legacy
+// workbuddy.json after the canonical workbuddy-<uid>.json save. That deletion
+// is rollback-hostile — the auth directory can be shared with the
+// still-running :3002 gateway, and the design's rollback path depends on the
+// pre-change credential files staying intact (旧凭据不回写不删除). Accepted
+// bounded cost: the host may register the same credential twice (both files
+// carry identical tokens); every state machine on this path is idempotent
+// (travel/check-in skip when already done, lifecycle notes de-duplicated), so
+// the duplicate is inert. Retiring the legacy file is an operator decision
+// after the staged cutover, never an automatic write here.
 func hostAuthPersistMigrate(name, path, legacyPath string, raw []byte) error {
-	if err := hostAuthPersist(name, path, raw); err != nil {
+	if err := hostAuthPersistFn(name, path, raw); err != nil {
 		return err
 	}
-	// If path was legacy and name is canonical, also write canonical path next to it.
-	if legacyPath != "" && !strings.EqualFold(filepath.Base(legacyPath), name) {
-		// host.auth.save already wrote name under auth dir; drop legacy file.
-		// A-36: use deleteAuthFileInDir (abs path + dir confine) for consistency.
-		if isLegacyWorkbuddyAuthName(filepath.Base(legacyPath)) {
-			_ = deleteAuthFileInDir(legacyPath, filepath.Dir(legacyPath))
-		}
+	if legacyPath != "" && isLegacyWorkbuddyAuthName(filepath.Base(legacyPath)) {
+		log.Printf("auth migrate: %s written; legacy credential preserved in place at %s (non-destructive)", name, legacyPath)
 	}
-	// If path points at legacy but name is uid form, do not dual-write path (would keep legacy alive).
 	return nil
 }
 
@@ -242,6 +274,37 @@ func parseDisabledFromAuthJSON(raw []byte) bool {
 	}
 	_ = json.Unmarshal(raw, &m)
 	return m.Disabled
+}
+
+// priorityDocKey is the top-level routing-tier key external tools write into
+// auth files (CPA panel, CPA-Manager-Plus batch priority, hand edits). The
+// plugin never authors it — it must only survive plugin rewrites and reach
+// the host record (see preservePluginDocKeys / handleParseAuth).
+const priorityDocKey = "priority"
+
+// priorityFromJSON extracts a top-level "priority" from a credential payload.
+// The host accepts both JSON numbers and numeric strings for the key (see the
+// management auth-files writer / file synthesizer), so both are accepted
+// here; anything else reports "absent" rather than guessing a value.
+func priorityFromJSON(raw []byte) (int, bool) {
+	if len(raw) == 0 {
+		return 0, false
+	}
+	var probe struct {
+		Priority any `json:"priority"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return 0, false
+	}
+	switch v := probe.Priority.(type) {
+	case float64:
+		return int(v), true
+	case string:
+		if parsed, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			return parsed, true
+		}
+	}
+	return 0, false
 }
 
 // isSafeWorkbuddyAuthPath rejects non-workbuddy filenames, empty paths, and

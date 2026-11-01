@@ -548,6 +548,10 @@ func fetchUserResource(sa *storedAuth) (*creditsSummary, error) {
 		}
 	}
 	_ = resp.Response.Data.TotalCount
+	// Soon-expiring subset for the weighted pool's expiring factor: packages
+	// whose CycleEndTime falls inside the configured window (same source data
+	// as the reference's UserResourceDetailed buckets; no extra upstream call).
+	sum.TotalExpiring = wbClampExpiring(sum.TotalRemain, wbExpiringSoonRemain(sum.Packages, now, loadedExpiringSoonWindow()))
 	return sum, nil
 }
 

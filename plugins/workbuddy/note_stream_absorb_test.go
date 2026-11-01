@@ -51,6 +51,8 @@ func TestDisplayNoteWithPrev(t *testing.T) {
 }
 
 func TestSyncAuthNotePreservesCreditsOnNilCr(t *testing.T) {
+	// Process-global note dedupe: reset so -count>1 sees a fresh-process start.
+	resetLifecycleDedupeForTest(t)
 	var persisted [][]byte
 	origGet, origPersist := hostAuthGetPhysicalFn, hostAuthPersistMigrateFn
 	hostAuthGetPhysicalFn = func(authIndex string) (*hostAuthPhysical, error) {

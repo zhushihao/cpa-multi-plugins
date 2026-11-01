@@ -10,9 +10,8 @@
 // 达标即自动领奖。所有动作幂等：已 claimed/已达标任务自动跳过。
 //
 // 真实对话类任务（Model_chat_GLM5.2 / skill_1 / expert_5 / Expert_team_use_3 /
-// Expert_lighthouse / black_cat）由 task_chat.go 承接：桌面指纹 SSE 真实对话取
-// 服务端 requestId + 模型对齐上报。black_cat 另有每日 23 点补跑位
-// （growthNightTaskTick，窗口外行为不计分）。
+// Expert_lighthouse）由 task_chat.go 承接：桌面指纹 SSE 真实对话取
+// 服务端 requestId + 模型对齐上报。
 package main
 
 import (
@@ -58,7 +57,6 @@ var growthAutoActions = []growthAutoAction{
 	{Code: "expert_5", Desc: "专家召唤+真实使用链", run: runAutoExpertUse},
 	{Code: "Expert_team_use_3", Desc: "专家团召唤+真实使用链", run: runAutoExpertTeamUse},
 	{Code: "Expert_lighthouse", Desc: "轻量云专家 LOCAL 链", run: runAutoExpertLighthouse},
-	{Code: "black_cat", Desc: "夜猫子（23-08 窗口）", run: runAutoBlackCat},
 }
 
 // growthMPTaskCodes 小程序口径专属下发的成长任务：默认列表不出现，

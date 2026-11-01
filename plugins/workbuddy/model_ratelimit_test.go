@@ -83,6 +83,8 @@ func TestParseRateLimitResetAtFrom(t *testing.T) {
 }
 
 func TestModelRateLimitRegistryLifecycle(t *testing.T) {
+	// Process-global registry: reset so -count>1 sees a fresh-process start.
+	resetModelRateLimitsForTest(t)
 	uid, model := "uid-registry-lifecycle", "deepseek-v4.1-flash"
 	key := modelRateLimitKey(uid, model)
 
@@ -126,6 +128,7 @@ func TestModelRateLimitRegistryLifecycle(t *testing.T) {
 }
 
 func TestNoteModelRateLimitFromPayload(t *testing.T) {
+	resetModelRateLimitsForTest(t)
 	uid, model := "uid-hook", "deepseek-v4.1-flash"
 
 	// Non-6004 payloads never touch the registry.
@@ -202,6 +205,7 @@ func TestTranslateChatUpstreamErrorFullModelScopedCopy(t *testing.T) {
 }
 
 func TestModelRateLimitErrorFastFail(t *testing.T) {
+	resetModelRateLimitsForTest(t)
 	uid, model := "uid-fastfail", "deepseek-v4.1-flash"
 	if err := modelRateLimitError(uid, model); err != nil {
 		t.Fatalf("no window registered yet, fast-fail must be nil, got %v", err)

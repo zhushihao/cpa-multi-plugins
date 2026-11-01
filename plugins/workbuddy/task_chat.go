@@ -1,9 +1,9 @@
 // task_chat.go 真实对话类成长任务——task_auto.go 指纹事件层覆盖不到的剩余
-// 6 项（Model_chat_GLM5.2 / skill_1 / expert_5 / Expert_team_use_3 /
-// Expert_lighthouse / black_cat）。判据共同点：需要与上游真实发生对话。
+// 5 项（Model_chat_GLM5.2 / skill_1 / expert_5 / Expert_team_use_3 /
+// Expert_lighthouse）。判据共同点：需要与上游真实发生对话。
 //
 // 两类机制（wb2api 2026-09 实测口径）：
-//  1. glm-5.2 类（Model_chat_GLM5.2、black_cat）：真实对话发生（服务端留痕）
+//  1. glm-5.2 类（Model_chat_GLM5.2）：真实对话发生（服务端留痕）
 //     + 上报 chat_request_send 且模型字段与对话一致（对话 glm-5.2、上报却带
 //     默认 flash 会被判不匹配）。report 的 conversationId 为调用方生成即可。
 //  2. JOIN 类（skill_1、expert_5、Expert_team_use_3、Expert_lighthouse）：
@@ -20,7 +20,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"regexp"
 	"time"
@@ -43,15 +42,10 @@ var growthServerIDRe = regexp.MustCompile(`^(cmb-)?[0-9a-f]{32}$`)
 const growthChatSystemPrompt = "You are a helpful assistant. 当前处于中文环境，使用简体中文回答。"
 
 // growthExpertSummonGap 专家召唤→对话→使用的节奏间隔（wb2api panel 同款 6s，
-// 其 v11 实测 8s 成功率 100%）。growthNightChatGap 夜间对话间隔（wb2api 同款
-// 4s）。var 以便测试注入归零。
+// 其 v11 实测 8s 成功率 100%）。var 以便测试注入归零。
 var (
 	growthExpertSummonGap = 6 * time.Second
-	growthNightChatGap    = 4 * time.Second
 )
-
-// growthNightWindowFn 夜间窗口判定（默认 growthInNightWindow(time.Now())，
-// var 以便测试注入固定结果）。
 
 // growthChatBaseOverride 任务对话端点测试注入点（与 setGrowthBase 同型）。
 var growthChatBaseOverride string
@@ -405,87 +399,4 @@ func runAutoExpertLighthouse(sa *storedAuth) (string, error) {
 		return "", fmt.Errorf("使用事件: %w", err)
 	}
 	return "已上报轻量云专家召唤+使用链（真实对话 requestId）", nil
-}
-
-// runAutoBlackCat black_cat（夜猫子）：23:00–08:00 本地窗口内 glm-5.2 真实
-// 对话 + 模型对齐上报，差额补足。窗口外不消耗对话额度（行为不计分），提示等
-// 每日 23 点补跑（checkin.go 夜间调度位）。
-func runAutoBlackCat(sa *storedAuth) (string, error) {
-	if !growthNightWindowFn() {
-		return "当前不在 23:00–08:00 计数窗口，行为不计分；每日 23 点自动补跑", nil
-	}
-	cur, target, _, err := growthTaskDeficit(sa, "black_cat")
-	if err != nil {
-		return "", err
-	}
-	need := target - cur
-	if need <= 0 {
-		return "进度已达标", nil
-	}
-	ok := 0
-	for i := int64(0); i < need; i++ {
-		if err := growthChatPlain(sa, "glm-5.2", "1+1等于几？直接回答。"); err != nil {
-			return "", fmt.Errorf("第 %d/%d 次对话: %w", i+1, need, err)
-		}
-		if err := growthReportActivityModel(sa, fmt.Sprintf("wb-night-%d-%d", time.Now().UnixMilli(), i), "", "glm-5.2", "GLM-5.2"); err != nil {
-			return "", fmt.Errorf("第 %d/%d 次上报: %w", i+1, need, err)
-		}
-		ok++
-		if i < need-1 {
-			time.Sleep(growthNightChatGap)
-		}
-	}
-	return fmt.Sprintf("已完成 %d 次夜间对话并上报", ok), nil
-}
-
-// growthInNightWindow 当前是否处于夜猫子计数窗口（23:00–08:00 本地时区，
-// wb2api WorkBuddy-Daily 实测口径：窗口外对话行为不计分）。
-func growthInNightWindow(now time.Time) bool {
-	h := now.Hour()
-	return h >= 23 || h < 8
-}
-
-var growthNightWindowFn = func() bool { return growthInNightWindow(time.Now()) }
-
-// growthNightTaskHours 夜间补跑位（本地时）：black_cat 只在 23:00–08:00 窗口
-// 计分，调度器在 23 点为其补跑（checkin.go schedulerLoop 同 tick 判定）。
-var growthNightTaskHours = []int{23}
-
-// shouldRunNightTaskNow 当前 tick 是否落在夜间补跑位后的 1 小时窗口内
-// （与 shouldRunKeepaliveNow 同型）。
-func shouldRunNightTaskNow(now time.Time) bool {
-	for _, h := range growthNightTaskHours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
-		if !now.Before(t) && now.Before(t.Add(time.Hour)) {
-			return true
-		}
-	}
-	return false
-}
-
-// growthNightTaskTick 每日 23 点补跑位：对所有 CN 账号尝试 black_cat（窗口内
-// 才真正消耗对话）。与用户触发的每日循环共用 per-account checkin 锁互斥。
-// 单账号失败只记日志，不影响其他账号。
-func growthNightTaskTick() {
-	files, err := hostAuthList()
-	if err != nil {
-		return
-	}
-	for _, f := range files {
-		f := f
-		sa, err := hostAuthGet(f.AuthIndex)
-		if err != nil || !tasksSupportsGrowth(sa) {
-			continue
-		}
-		mu := checkinLockFor(f.AuthIndex)
-		mu.Lock()
-		msg, err := runAutoBlackCat(sa)
-		mu.Unlock()
-		switch {
-		case err != nil:
-			log.Printf("workbuddy: 夜间补跑 black_cat 失败（%s）: %v", sa.Account.Nickname, err)
-		case msg != "" && msg != "进度已达标":
-			log.Printf("workbuddy: 夜间补跑 black_cat（%s）: %s", sa.Account.Nickname, msg)
-		}
-	}
 }

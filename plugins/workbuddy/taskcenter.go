@@ -131,9 +131,10 @@ type tasksBonusResult struct {
 	Error     string   `json:"error,omitempty"`
 }
 
-// tasksDailyBonus runs the full daily loop for ONE CN account. Never panics
-// upward: upstream failures land in the summary lines, the overall success
-// flag only means "loop completed" (not "every step green").
+// tasksDailyBonusFn is the per-account dispatch seam used by the batch
+// /tasks/run endpoint (tests count exactly one run per account).
+var tasksDailyBonusFn = tasksDailyBonus
+
 // tasksDailyBonus runs the full daily loop for ONE CN account. Never panics
 // upward: upstream failures land in the summary lines, the overall success
 // flag only means "loop completed" (not "every step green").
@@ -149,7 +150,46 @@ type tasksBonusResult struct {
 //     rejected again). The 403 "连续登录天数不足" tier-lock is exempt —
 //     it is the normal not-yet-unlocked state, not a dead session;
 //   - the buddy box (the energy sink) and an energy-balance tail are new.
+//
+// tasksDailyBonus is the manual entry point (includes the travel step).
+// The auto check-in tick uses tasksDailyBonusMode with includeTravel derived
+// from autoTasksIncludeTravel().
 func tasksDailyBonus(sa *storedAuth) *tasksBonusResult {
+	return tasksDailyBonusMode(sa, manualTasksIncludeTravel())
+}
+
+// manualTasksIncludeTravel is the manual /tasks/run entry's travel flag.
+// Solution-architect ruling (2026-09-29): the travel switch closes every
+// AUTOMATIC entry point, but a manual task run keeps the original semantics.
+func manualTasksIncludeTravel() bool { return true }
+
+// autoTasksIncludeTravel reports whether an AUTOMATIC task-loop entry may
+// advance travel. Solution-architect ruling (2026-09-29): a disabled travel
+// switch must cover ALL automatic entries (the reverse gap fixed here), and
+// when travel_auto is on the independent six-slot pass owns travel — so no
+// automatic loop ever advances travel. Manual runs use
+// manualTasksIncludeTravel.
+func autoTasksIncludeTravel() bool {
+	return false
+}
+
+// tasksDailyBonusModeFn is the dispatch seam for the scheduled tick
+// (tests record the includeTravel flag without running the network loop).
+var tasksDailyBonusModeFn = tasksDailyBonusMode
+
+// tasksTravelOnceFn is the test seam for the travel step.
+var tasksTravelOnceFn = tasksTravelOnce
+
+// tasksTravelStep advances travel for one account when the caller owns it.
+// Split out so the ownership gating is unit-testable without network.
+func tasksTravelStep(sa *storedAuth, includeTravel bool, add func(string, ...any)) {
+	if !includeTravel {
+		return
+	}
+	tasksTravelOnceFn(sa, add)
+}
+
+func tasksDailyBonusMode(sa *storedAuth, includeTravel bool) *tasksBonusResult {
 	res := &tasksBonusResult{}
 	add := func(format string, args ...any) {
 		res.Lines = append(res.Lines, fmt.Sprintf(format, args...))
@@ -288,10 +328,10 @@ func tasksDailyBonus(sa *storedAuth) *tasksBonusResult {
 		tasksAutoLightOnce(sa, add)
 	}
 
-	// 5. Buddy travel state machine (single pass, no waiting/polling).
-	if !dead {
-		tasksTravelOnce(sa, add)
-	}
+	// 5. Buddy travel state machine (single pass, no waiting/polling). Gated:
+	// when the independent six-slot travel pass owns travel, the check-in tick
+	// must not also advance it (manual runs still pass includeTravel=true).
+	tasksTravelStep(sa, includeTravel && !dead, add)
 
 	// 6. Streak tier redemption (2026-09: tier id form, granted fields,
 	// locked-tier 403 = expected skip, unknown-tier 400 = legacy day retry).
@@ -643,7 +683,7 @@ func handleTasksRun(req pluginapi.ManagementRequest) map[string]any {
 	authIndex := strings.TrimSpace(body.AuthIndex)
 	single := authIndex != ""
 
-	files, err := hostAuthList()
+	files, err := hostAuthListFn()
 	if err != nil {
 		return map[string]any{"error": err.Error()}
 	}
@@ -656,6 +696,16 @@ func handleTasksRun(req pluginapi.ManagementRequest) map[string]any {
 	if len(targets) == 0 {
 		return map[string]any{"error": "no matching account"}
 	}
+	// Batch mode: legacy + canonical copies of one credential are one upstream
+	// account — run the daily loop once (second audit). Single-account mode is
+	// explicit and never deduplicated.
+	duplicates := 0
+	if !single {
+		targets, duplicates = wbDedupedTargets(targets)
+		if len(targets) == 0 {
+			return map[string]any{"error": "no matching account"}
+		}
+	}
 
 	results := make([]*tasksBonusResult, len(targets))
 	var wg sync.WaitGroup
@@ -667,7 +717,7 @@ func handleTasksRun(req pluginapi.ManagementRequest) map[string]any {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			sa, err := hostAuthGet(f.AuthIndex)
+			sa, err := hostAuthGetFn(f.AuthIndex)
 			if err != nil {
 				results[i] = &tasksBonusResult{AuthIndex: f.AuthIndex, Error: err.Error()}
 				return
@@ -679,10 +729,10 @@ func handleTasksRun(req pluginapi.ManagementRequest) map[string]any {
 				results[i].Lines = []string{"任务中心仅 CN 账号支持"}
 				return
 			}
-			mu := checkinLockFor(f.AuthIndex)
+			mu := wbAccountLockFor(f.AuthIndex, sa)
 			mu.Lock()
 			defer mu.Unlock()
-			results[i] = tasksDailyBonus(sa)
+			results[i] = tasksDailyBonusFn(sa)
 			results[i].AuthIndex = f.AuthIndex
 			results[i].Nickname = sa.Account.Nickname
 		}()
@@ -703,10 +753,11 @@ func handleTasksRun(req pluginapi.ManagementRequest) map[string]any {
 	return map[string]any{
 		"results": results,
 		"summary": map[string]any{
-			"total":   len(targets),
-			"success": okN,
-			"skipped": skipN,
-			"fail":    errN,
+			"total":     len(targets),
+			"success":   okN,
+			"skipped":   skipN,
+			"duplicate": duplicates,
+			"fail":      errN,
 		},
 	}
 }

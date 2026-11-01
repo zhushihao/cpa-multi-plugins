@@ -107,6 +107,12 @@ func hostAuthGet(authIndex string) (*storedAuth, error) {
 	return parseStored(phys.JSON)
 }
 
+// hostAuthGetFn is the read seam for tests that drive account loops (travel,
+// scheduled check-in) without a live host RPC bridge. Production callers use
+// it through hostAuthGetFn — never hostAuthGet directly — so a single stub
+// covers the whole loop.
+var hostAuthGetFn = hostAuthGet
+
 // hostAuthGetBundle is one host.auth.get for both storage and physical metadata
 // (avoids the previous double-RPC in dashboard: get + getPhysical).
 func hostAuthGetBundle(authIndex string) (*storedAuth, *hostAuthPhysical, error) {
@@ -120,3 +126,7 @@ func hostAuthGetBundle(authIndex string) (*storedAuth, *hostAuthPhysical, error)
 	}
 	return sa, phys, nil
 }
+
+// hostAuthGetBundleFn is the read seam for tests that drive the lifecycle
+// reconcile loop without a live host RPC bridge.
+var hostAuthGetBundleFn = hostAuthGetBundle

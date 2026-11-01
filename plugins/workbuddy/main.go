@@ -10,52 +10,12 @@
 // by Sliverkiss. Original credit for the workbuddy plugin goes to Sliverkiss;
 // see https://github.com/Sliverkiss/cpa-plugin. Built with -buildmode=c-shared
 // and exports the cliproxy C ABI entry points.
+//
+// The cgo surface (C preamble, exported entry points, hostCall, writeResponse)
+// lives in cgo_bridge.go behind a `cgo` build tag so the package can be
+// compiled and unit-tested with CGO_ENABLED=0 (no MinGW toolchain); see the
+// comment there.
 package main
-
-/*
-#include <stdint.h>
-#include <stdlib.h>
-
-typedef struct {
-        void* ptr;
-        size_t len;
-} cliproxy_buffer;
-
-typedef int (*cliproxy_host_call_fn)(void*, const char*, const uint8_t*, size_t, cliproxy_buffer*);
-typedef void (*cliproxy_host_free_fn)(void*, size_t);
-
-typedef struct {
-        uint32_t abi_version;
-        void* host_ctx;
-        cliproxy_host_call_fn call;
-        cliproxy_host_free_fn free_buffer;
-} cliproxy_host_api;
-
-typedef int (*cliproxy_plugin_call_fn)(char*, uint8_t*, size_t, cliproxy_buffer*);
-typedef void (*cliproxy_plugin_free_fn)(void*, size_t);
-typedef void (*cliproxy_plugin_shutdown_fn)(void);
-
-typedef struct {
-        uint32_t abi_version;
-        cliproxy_plugin_call_fn call;
-        cliproxy_plugin_free_fn free_buffer;
-        cliproxy_plugin_shutdown_fn shutdown;
-} cliproxy_plugin_api;
-
-// Wrappers so Go can invoke the host function-pointer table via cgo. The host
-// API captured at init is used to push streaming chunks back asynchronously.
-static int wb_call_host(cliproxy_host_api* api, const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response) {
-        return api->call(api->host_ctx, method, request, request_len, response);
-}
-static void wb_free_host_buffer(cliproxy_host_api* api, void* ptr, size_t len) {
-        api->free_buffer(ptr, len);
-}
-
-extern int cliproxyPluginCall(char*, uint8_t*, size_t, cliproxy_buffer*);
-extern void cliproxyPluginFree(void*, size_t);
-extern void cliproxyPluginShutdown(void);
-*/
-import "C"
 
 import (
 	"bytes"
@@ -65,10 +25,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/usage"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
@@ -116,8 +76,7 @@ type loginCtx struct {
 }
 
 var (
-	hostAPI        *C.cliproxy_host_api // captured at init, used for async host calls
-	loginStates    sync.Map             // state(string) -> *loginCtx
+	loginStates    sync.Map // state(string) -> *loginCtx
 	httpClientOnce sync.Once
 	sharedClient   *http.Client
 )
@@ -143,100 +102,6 @@ func init() {
 }
 
 func main() {}
-
-// -----------------------------------------------------------------------------
-// C ABI exports
-// -----------------------------------------------------------------------------
-
-//export cliproxy_plugin_init
-func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
-	if plugin == nil {
-		return 1
-	}
-	hostAPI = host
-	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
-	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
-	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
-	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
-	return 0
-}
-
-//export cliproxyPluginCall
-func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t, response *C.cliproxy_buffer) C.int {
-	if response != nil {
-		response.ptr = nil
-		response.len = 0
-	}
-	if method == nil {
-		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
-		return 1
-	}
-	var requestBytes []byte
-	if request != nil && requestLen > 0 {
-		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
-	}
-	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
-	if errHandle != nil {
-		writeResponse(response, errorEnvelopeFor(errHandle))
-		return 1
-	}
-	writeResponse(response, raw)
-	return 0
-}
-
-//export cliproxyPluginFree
-func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
-	if ptr != nil {
-		C.free(ptr)
-	}
-}
-
-//export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {
-	// Intentionally a no-op. The host calls this on its own exit path (after
-	// the host Go runtime has started tearing down) and dlclose()es this
-	// library immediately afterwards. Touching any Go runtime state here —
-	// mutexes, channel close, goroutine synchronization — risks a SIGSEGV in
-	// cgo (observed on every docker restart: SIGSEGV in
-	// _Cfunc_cliproxy_shutdown_plugin, PC near a freed runtime pointer).
-	// The scheduler goroutine and janitor ticker hold no resources that
-	// outlive the process; the OS reclaims them on exit.
-}
-
-// -----------------------------------------------------------------------------
-// Host calls (async streaming + auth callbacks)
-// -----------------------------------------------------------------------------
-
-// hostCall invokes a host RPC method via the function-pointer table captured
-// at init. Used to push stream chunks back asynchronously (host.stream.emit /
-// host.stream.close) and to read the host's auth store (host.auth.list/get).
-func hostCall(method string, request []byte) ([]byte, error) {
-	if hostAPI == nil || hostAPI.call == nil {
-		return nil, fmt.Errorf("host API unavailable")
-	}
-	cMethod := C.CString(method)
-	defer C.free(unsafe.Pointer(cMethod))
-	var cReq unsafe.Pointer
-	var reqLen C.size_t
-	if len(request) > 0 {
-		cReq = C.CBytes(request)
-		defer C.free(cReq)
-		reqLen = C.size_t(len(request))
-	}
-	var resp C.cliproxy_buffer
-	rc := C.wb_call_host(hostAPI, cMethod, (*C.uint8_t)(cReq), reqLen, &resp)
-	var out []byte
-	if resp.ptr != nil && resp.len > 0 {
-		out = C.GoBytes(resp.ptr, C.int(resp.len))
-	}
-	if resp.ptr != nil && hostAPI.free_buffer != nil {
-		C.wb_free_host_buffer(hostAPI, resp.ptr, resp.len)
-	}
-	if rc != 0 {
-		return out, fmt.Errorf("host call %s returned %d", method, int(rc))
-	}
-	return out, nil
-}
 
 // -----------------------------------------------------------------------------
 
@@ -283,8 +148,23 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleManagement(request)
 	case pluginabi.MethodSchedulerPick:
 		return handleSchedulerPick(request)
+	case pluginabi.MethodRequestInterceptBefore:
+		return handleRequestInterceptBefore(request)
+	case pluginabi.MethodRequestInterceptAfter:
+		return handleRequestInterceptAfter(request)
 	case pluginabi.MethodUsageHandle:
 		return handleUsage(request)
+	// QuotaProvider capability (host v7.3.11 sdk/pluginapi/types.go:1484).
+	// Method names mirror pluginabi locally — the build SDK (v7.2.30) predates
+	// them; see quota_provider.go. Hosts older than v7.3.x never send these.
+	case methodQuotaIdentifier:
+		return okEnvelope(identifierResponse{Identifier: providerName})
+	case methodQuotaDescribe:
+		return handleQuotaDescribe()
+	case methodQuotaFetch:
+		return handleQuotaFetch(request)
+	case methodQuotaReset:
+		return handleQuotaReset()
 	default:
 		return errorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
@@ -338,10 +218,24 @@ type registrationCapability struct {
 	Scheduler             bool                         `json:"scheduler"`
 	ManagementAPI         bool                         `json:"management_api"`
 	UsagePlugin           bool                         `json:"usage_plugin"`
+	// RequestInterceptor enables the request.intercept_before/after hooks used
+	// by the session-stickiness header bridge (session_stick.go). The host
+	// invokes every active interceptor for every request, so the hook's scope
+	// fences (advertised-model check, signature verification, header clearing)
+	// are what keep non-WorkBuddy traffic untouched.
+	RequestInterceptor bool `json:"request_interceptor"`
+	// QuotaProvider declares the quota.* RPC surface (host v7.3.11
+	// pluginapi.QuotaProvider; wire mirror in quota_provider.go). The host
+	// flips SupportsQuota on this flag, derives the provider key from
+	// quota.identifier, and serves the management credential-quota endpoint
+	// from quota.fetch — which projects the existing accountCache snapshot
+	// read-only (no new upstream calls; unknown data reports unavailable).
+	// Older hosts ignore the unknown key entirely.
+	QuotaProvider bool `json:"quota_provider"`
 }
 
 // version is injected at build time via -ldflags "-X main.version=...".
-var version = "0.9.44"
+var version = "0.9.48"
 
 func wbRegistration() registration {
 	return registration{
@@ -354,16 +248,20 @@ func wbRegistration() registration {
 			Logo:             pluginLogoURL,
 			ConfigFields: []pluginapi.ConfigField{
 				{Name: "checkin_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable daily auto check-in at 09:00 and 21:00 local time for CN accounts (default true)."},
-				{Name: "tasks_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Growth-center daily bonus loop for CN accounts after each auto check-in tick: activity report, makeup card, task accept/claim, buddy travel, streak redeem, lottery (default true). Manual run via POST /tasks/run regardless of this toggle."},
+				{Name: "tasks_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Growth-center daily bonus loop for CN accounts after each auto check-in tick: activity report, makeup card, task accept/claim, buddy travel, streak redeem, lottery (default true). Manual run via POST /tasks/run regardless of this toggle. NOTE: this switch does NOT gate the independent travel pass — travel_auto is its own explicit control (reference :3002 semantics: travel has a separate travel_enabled schedule)."},
 				{Name: "lifecycle_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Auto disable CN / delete Global when credits exhausted; re-enable CN after check-in restores credits (default true)."},
 				{Name: "token_keepalive", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Enable daily access-token refresh at 22:00 local time to prevent Keycloak offline-session expiry (default true)."},
 				{Name: "login_platform", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"CLI", "ide"}, Description: "Client variant used for NEW logins: CLI (WorkBuddy, default) or ide (CodeBuddy IDE). Existing accounts keep the platform recorded at login/import time."},
 				{Name: "login_region", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"cn", "intl"}, Description: "Realm for NEW logins: cn (copilot.tencent.com, default) or intl (codebuddy.ai, IDE client; merged codebuddy-intl plugin). Global (workbuddy.ai) accounts are added via panel credential import."},
-				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional model list. Each item can have id, name, alias, context, max_tokens, enabled, reasoning. NOTE: for realm-scoped pinning use models_cn / models_global / models_intl below."},
-				{Name: "models_cn", Type: pluginapi.ConfigFieldTypeString, Description: "Leave empty (recommended): each CN account then supports exactly what copilot.tencent.com returns for its credential token (5-min cache). Optional comma-separated upstream model IDs to pin/override the CN model output."},
+				{Name: "models", Type: pluginapi.ConfigFieldTypeArray, Description: "Optional model list. Each item can have id, name, alias, context, max_tokens, enabled, reasoning. NOTE: for realm-scoped pinning use models_global / models_intl below (models_cn is deprecated and ignored)."},
+				{Name: "models_cn", Type: pluginapi.ConfigFieldTypeString, Description: "DEPRECATED — no longer used: the CN catalog is now the union of every CN credential's discovery (one account missing a model no longer hides it). This key is parsed for tolerance but ignored; safe to delete from config."},
 				{Name: "models_global", Type: pluginapi.ConfigFieldTypeString, Description: "Leave empty (recommended): each Global account then supports exactly what workbuddy.ai returns for its credential token (5-min cache). Optional comma-separated upstream model IDs to pin/override the Global model output."},
 				{Name: "models_intl", Type: pluginapi.ConfigFieldTypeString, Description: "Leave empty (recommended): each Intl account then supports exactly what codebuddy.ai returns for its credential token (5-min cache) - no pre-filled guessing, so unsupported models are never advertised or routed. Optional comma-separated upstream model IDs to pin/override the Intl model output."},
-				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits}, Description: "Multi-account selection: off (defer to built-in, default) or credits (pick highest remaining). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set scheduler_mode=credits."},
+				{Name: "scheduler_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{schedulerModeOff, schedulerModeCredits, schedulerModeWeighted}, Description: "Multi-account selection: off (defer to built-in, default), credits (panel-selected active account), or weighted (cost-tier aware weighted pool with 30m free-tier exploration and first-user-message session stickiness). WARNING: when off + lifecycle_auto=false, exhausted accounts may still be routed — enable lifecycle_auto or set a routing mode."},
+				{Name: "travel_auto", Type: pluginapi.ConfigFieldTypeBoolean, Description: "Independent six-slot cat-travel schedule at travel_hours (default true, matching :3002's default-on independent travel schedule; independent of tasks_auto). When on, travel no longer rides the 09:00/21:00 check-in tick; the auto pass advances each CN account once per slot. When off, NO automatic entry point advances travel (the check-in tick's task loop included); a manual POST /tasks/run still includes the travel step."},
+				{Name: "travel_hours", Type: pluginapi.ConfigFieldTypeString, Description: "Comma-separated CST (Asia/Shanghai) travel hours for the independent travel pass (default \"1,5,9,13,17,21\"). Invalid entries are dropped; an unusable value falls back to the default schedule."},
+				{Name: "expiring_soon", Type: pluginapi.ConfigFieldTypeString, Description: "Go duration window for the \"soon-expiring credits\" routing factor (default 168h = 7 days, matching the reference). Packages whose cycle ends inside the window mark their remaining balance as expiring, so sessions consume it first. \"0\" or a negative value disables the bucket."},
+				{Name: "state_file", Type: pluginapi.ConfigFieldTypeString, Description: "Cost-ledger state file for restart-durable cost tiers (schema-versioned JSON, atomic writes, 6h TTL). Default: <user cache>/workbuddy-plugin/cost-ledger.json; WORKBUDDY_STATE_FILE overrides it; \"off\" disables persistence. Paths that look like credentials or sit inside the host auth directory are rejected."},
 				{Name: "stream_head_timeout", Type: pluginapi.ConfigFieldTypeInteger, Description: "Opt-in async-stream head gate, in seconds (default 0 = disabled, unchanged behavior). When > 0 the executor waits up to this long for the first decisive upstream event before opening the host stream, so a pre-answer failure (upstream >=400 or an error frame before the model starts answering) returns as a normal failed request with an HTTP status instead of a lossy in-band text error. Never blocks longer than this, and a silent stream is released normally."},
 				{Name: "usage_report_url", Type: pluginapi.ConfigFieldTypeString, Description: "Optional override of CPAMP usage import URL (default http://cpa-manager-plus:18317/v0/management/usage/import; also env USAGE_REPORT_URL)."},
 				{Name: "usage_report_key", Type: pluginapi.ConfigFieldTypeString, Description: "Optional CPAMP admin key override. Prefer auto-detect from env CPAMP_ADMIN_KEY / USAGE_REPORT_KEY or secret file /run/secrets/cpamp_admin_key."},
@@ -380,6 +278,8 @@ func wbRegistration() registration {
 			ManagementAPI:         true,
 			Scheduler:             true,
 			UsagePlugin:           true,
+			RequestInterceptor:    true,
+			QuotaProvider:         true,
 		},
 	}
 }
@@ -406,6 +306,20 @@ type realmModelsEntry struct {
 	lastErr   string
 	lastErrAt time.Time
 	lastLogAt time.Time // throttles the discovery-failure log line
+	// Round6 slice 3: per-credential discovery contributions behind the
+	// realm catalog. models (above) is the UNION of every entry here with
+	// models != nil — the cross-account catalog that replaced the single
+	// slot. A nil-models entry is a failure marker (retry gated by the
+	// union TTL); see models.go storeCredentialModels.
+	creds map[string]realmModelsContribution
+}
+
+// realmModelsContribution is one credential's last discovery attempt inside
+// a realm: the discovered list on success, nil (with `at` stamped) as the
+// failure marker that gates retries.
+type realmModelsContribution struct {
+	models []pluginapi.ModelInfo
+	at     time.Time
 }
 
 var dynamicModelsCache = struct {
@@ -730,6 +644,28 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	if fn := strings.TrimSpace(req.FileName); fn != "" {
 		ad.FileName = fn
 	}
+	// Round6: the top-level priority external tools write into the file is the
+	// routing tier of this credential. The host's plugin-auth branch does not
+	// copy it from the raw file (only the non-plugin synthesizer path does),
+	// and authPriority() reads it from the record's Attributes — surface it
+	// here so a host restart/reload keeps the tier the file declares. Absent
+	// key → no attribute (never invent a tier).
+	//
+	// The SAME value is mirrored into AuthData.Metadata: the host's own
+	// auth-save serializes Metadata keys back into the file (that is the
+	// write path that repeatedly stripped hand-written priority — the plugin
+	// save funnel cannot intercept host-memory-driven saves). With priority
+	// in Metadata, every host-side re-save carries the tier forward.
+	if p, ok := priorityFromJSON(req.RawJSON); ok {
+		if ad.Attributes == nil {
+			ad.Attributes = map[string]string{}
+		}
+		ad.Attributes[priorityDocKey] = strconv.Itoa(p)
+		if ad.Metadata == nil {
+			ad.Metadata = map[string]any{}
+		}
+		ad.Metadata[priorityDocKey] = p
+	}
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
 		Auth:    ad,
@@ -781,6 +717,63 @@ func toAuthDataOptsWithNote(sa *storedAuth, cr *creditsSummary, disabled bool, p
 }
 
 // -----------------------------------------------------------------------------
+// Chat-ingress model-name contract (bare upstream model names only)
+// -----------------------------------------------------------------------------
+
+// wbRemovedRealmPrefix reports the round4 realm namespace a client model name
+// starts with ("cn:", "global:", "intl:"; case-insensitive, after trimming),
+// or "" when the name carries none. Issue #6 owner correction: this candidate
+// serves bare upstream model names only, so these prefixes are removed — not
+// accepted, not advertised. They are the ONLY special colon forms: any other
+// colon text is part of a model id and stays upstream's business.
+func wbRemovedRealmPrefix(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, p := range []string{"cn:", "global:", "intl:"} {
+		if strings.HasPrefix(m, p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// wbRemovedRealmPrefixError builds the fail-closed rejection for a client name
+// that still uses the removed realm namespace. The message carries
+// "invalid_request_error" so the host classifies the failure as a client
+// request error (coreauth.isRequestInvalidError) instead of retrying it
+// against other credentials and cooling the account down; the 400 status is
+// what the client sees. The suggested replacement is the bare id.
+func wbRemovedRealmPrefixError(model, prefix string) error {
+	m := strings.TrimSpace(model)
+	rest := ""
+	if len(m) >= len(prefix) {
+		rest = strings.TrimSpace(m[len(prefix):])
+	}
+	if rest == "" {
+		rest = "<model-id>"
+	}
+	return &statusError{
+		status: http.StatusBadRequest,
+		err: fmt.Errorf(
+			"invalid_request_error: 模型名 %q 使用了已移除的 realm 前缀 %q；候选 WorkBuddy 只接受上游原始模型 ID，请改用 %q。"+
+				" // model %q uses the removed realm prefix %q; this candidate accepts bare upstream model ids only — use %q",
+			model, prefix, rest, model, prefix, rest),
+	}
+}
+
+// wbIngressUpstreamModel resolves the model id a chat request must send
+// upstream. Bare-name-only contract (Issue #6 owner correction): a name that
+// still carries the removed round4 realm namespace is denied here — never
+// stripped and never forwarded to upstream — while every other name goes
+// through the host oauth-model-alias table exactly as it did before the
+// namespace ever existed (no static alias table).
+func wbIngressUpstreamModel(model string, attributes map[string]string) (string, error) {
+	if prefix := wbRemovedRealmPrefix(model); prefix != "" {
+		return "", wbRemovedRealmPrefixError(model, prefix)
+	}
+	return resolveUpstreamModel(model, attributes), nil
+}
+
+// -----------------------------------------------------------------------------
 
 func handleExecExecute(raw []byte) ([]byte, error) {
 	var req pluginapi.ExecutorRequest
@@ -791,14 +784,23 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Resolve oauth-model-alias (e.g. "point/deepseek-v4-flash") back to the
-	// real upstream model ID; the upstream rejects unknown alias IDs.
-	upstreamModel := resolveUpstreamModel(req.Model, req.AuthAttributes)
+	// Bare-name-only contract (Issue #6 owner correction): the round4 cn:/
+	// global:/intl: realm namespace is removed — a prefixed name is denied at
+	// this candidate, never stripped. Bare names resolve oauth-model-alias
+	// (e.g. "point/deepseek-v4-flash") back to the real upstream model ID; the
+	// upstream rejects unknown alias IDs.
+	upstreamModel, err := wbIngressUpstreamModel(req.Model, req.AuthAttributes)
+	if err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	authUID := ""
 	if sa.Account.UID != "" {
 		authUID = sa.Account.UID
 	}
+	// Keep the candidate-dedup resolver warm: this request proves which host
+	// auth record ID carries which account identity (I5).
+	wbRememberAuthIdentity(req.AuthID, sa)
 	// v0.9.32: model-scoped 6004 fast-fail — a model under an active
 	// upstream rate-limit window fails here without an upstream call.
 	// Other (credential, model) pairs are untouched; the error stays
@@ -843,7 +845,9 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, 0, err.Error())
 		return nil, err
 	}
-	publishUsage(req.Model, upstreamModel, authUID, started, usageDetailFromCompletion(completion), false, 0, "")
+	// CPAMP keeps the account UID; the routing cost ledger is keyed by the host
+	// auth record ID (req.AuthID) — the identity SchedulerPick can address (S1).
+	publishUsageWithUsage(req.Model, upstreamModel, authUID, req.AuthID, started, usageDetailFromCompletion(completion), usageMapFromCompletion(completion), false, 0, "")
 	// v0.9.25: learn the real model behind a tier alias from the response echo.
 	noteLearnedRealModel(upstreamModel, modelFromCompletionPayload(completion))
 	invalidateAccountCredits(req.AuthID, authUID)
@@ -867,12 +871,20 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	upstreamModel := resolveUpstreamModel(req.Model, req.AuthAttributes)
+	// Bare-name-only contract: the stream path resolves the model name
+	// exactly like handleExecExecute (see there) — prefixed names are denied.
+	upstreamModel, err := wbIngressUpstreamModel(req.Model, req.AuthAttributes)
+	if err != nil {
+		return nil, err
+	}
 	started := time.Now()
 	authUID := ""
 	if sa.Account.UID != "" {
 		authUID = sa.Account.UID
 	}
+	// Keep the candidate-dedup resolver warm: this request proves which host
+	// auth record ID carries which account identity (I5).
+	wbRememberAuthIdentity(req.AuthID, sa)
 	// v0.9.32: model-scoped 6004 fast-fail — a model under an active
 	// upstream rate-limit window fails here without an upstream call.
 	// Other (credential, model) pairs are untouched; the error stays
@@ -899,7 +911,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 			publishUsage(req.Model, upstreamModel, authUID, started, usage.Detail{}, true, statusCode, errCollect.Error())
 			return nil, errCollect
 		}
-		publishUsage(req.Model, upstreamModel, authUID, started, collector.detail(), false, 0, "")
+		publishUsageWithUsage(req.Model, upstreamModel, authUID, req.AuthID, started, collector.detail(), collector.last, false, 0, "")
 		noteLearnedRealModel(upstreamModel, collector.respModel)
 		invalidateAccountCredits(req.AuthID, authUID)
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
@@ -965,16 +977,4 @@ func errorEnvelopeFor(err error) []byte {
 		return raw
 	}
 	return errorEnvelope("plugin_error", err.Error())
-}
-
-func writeResponse(response *C.cliproxy_buffer, raw []byte) {
-	if response == nil || len(raw) == 0 {
-		return
-	}
-	ptr := C.CBytes(raw)
-	if ptr == nil {
-		return
-	}
-	response.ptr = ptr
-	response.len = C.size_t(len(raw))
 }

@@ -282,7 +282,7 @@ func pumpUpstreamStream(httpReq *http.Request, cancel context.CancelFunc, stream
 		streamEmitError(streamID, readErr.Error())
 		return
 	}
-	publishUsage(requestedModel, upstreamModel, authUID, started, collector.detail(), false, 0, "")
+	publishUsageWithUsage(requestedModel, upstreamModel, authUID, authID, started, collector.detail(), collector.last, false, 0, "")
 	// v0.9.25: learn the real model behind a tier alias from the response
 	// echo (Intl only — no-op for every other id).
 	noteLearnedRealModel(upstreamModel, collector.respModel)

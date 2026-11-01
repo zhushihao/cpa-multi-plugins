@@ -181,9 +181,12 @@ func TestFetchDynamicModelsRecordsSourceState(t *testing.T) {
 	}
 }
 
-// TestFetchDynamicModelsPinRecordsState: a models_cn pin replaces discovery
-// for the realm entirely — the recorded state must say so (this is how a
-// stale pin gets caught when "the new model never shows up").
+// TestFetchDynamicModelsPinRecordsState: models_cn is DEPRECATED (round6
+// slice 3) — the line stays parseable but must no longer generate or restrict
+// the CN catalog: the cross-account discovery union owns it. The old
+// single-source pin is exactly what made CN models flicker when two accounts'
+// catalogs diverged (one missing kimi-k3-2 / glm-5.3-flashx / minimax-m3-pay).
+// The realm state must therefore never report a "pin" source for CN again.
 func TestFetchDynamicModelsPinRecordsState(t *testing.T) {
 	resetDynamicModelsCache()
 	defer resetDynamicModelsCache()
@@ -201,18 +204,18 @@ func TestFetchDynamicModelsPinRecordsState(t *testing.T) {
 	called := false
 	discoverModelsFn = func(accessToken, realm, uid string) ([]pluginapi.ModelInfo, error) {
 		called = true
-		return realmTestModels("x"), nil
+		return realmTestModels("x", "y"), nil
 	}
 	got := fetchDynamicModelsFromStorage([]byte(`{"accessToken":"tok","region":"cn"}`))
-	if called {
-		t.Fatal("pin must skip discovery entirely")
+	if !called {
+		t.Fatal("deprecated models_cn pin must not suppress CN discovery anymore")
 	}
-	if len(got) != 1 || got[0].ID != "deepseek-v4.1-flash" {
-		t.Fatalf("pin must be served verbatim: %+v", discoveryIDs(got))
+	if len(got) != 2 || got[0].ID != "x" {
+		t.Fatalf("CN catalog must come from discovery, not the pin: %+v", discoveryIDs(got))
 	}
 	st := realmModelStateFor("cn")
-	if st == nil || !strings.HasPrefix(st.Source, "pin") || st.Count != 1 {
-		t.Fatalf("pin state = %+v, want source=pin count=1", st)
+	if st == nil || strings.HasPrefix(st.Source, "pin") || st.Count != 2 {
+		t.Fatalf("CN state = %+v, want a discovery source with count 2 (never pin)", st)
 	}
 }
 

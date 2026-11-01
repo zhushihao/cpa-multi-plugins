@@ -6,6 +6,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -14,8 +15,10 @@ import (
 	"time"
 )
 
-// check-in schedule: 09:00 and 21:00 local time.
-var checkinHours = []int{9, 21}
+// check-in schedule: single midnight slot 00:00 + random 5–15 min offset
+// (owner schedule ruling 2026-09-30: 00:05–00:15 CST). The 21:00 tick was
+// dropped; travel keeps its independent six-slot schedule ([1,5,9,13,17,21]).
+var checkinHours = []int{0}
 
 // plugin-level config decoded from plugin.register/reconfigure config_yaml.
 var (
@@ -64,11 +67,17 @@ var (
 	managementAPIKeyMu sync.RWMutex
 
 	// pinnedModels: per-realm user-pinned model ID lists from config_yaml
-	// models_cn / models_global / models_intl (comma-separated upstream IDs).
+	// models_global / models_intl (comma-separated upstream IDs).
 	// When set for a realm, the credential model output is exactly this list
 	// and dynamic discovery is skipped for it (v0.12.19) — the user-written
 	// "which models this credential supports" contract. Reconfigure with the
 	// key absent resets that realm to discovery + static fallback.
+	//
+	// models_cn is DEPRECATED (round6 slice 3, 2026-09-30): still parsed here
+	// for tolerance, but the serve layer (models.go fetchDynamicModelsFromStorageInner)
+	// ignores it — the CN catalog is the union of every CN credential's
+	// discovery, which is what made the pin unnecessary. The line is safe to
+	// delete from config.
 	pinnedModels   = map[string][]string{}
 	pinnedModelsMu sync.RWMutex
 
@@ -118,6 +127,10 @@ func configure(raw []byte) {
 	nextLoginPlatform := "CLI"
 	nextLoginRegion := regionCN
 	nextStreamHeadTimeout := 0 // default off: 0 seconds
+	nextTravelAuto := true
+	nextTravelHours := ""
+	nextExpiringSoon := defaultExpiringSoonWindow
+	nextStateFile := ""
 
 	nextPinned := map[string][]string{}
 	cfgURL, cfgKey := "", ""
@@ -140,9 +153,30 @@ func configure(raw []byte) {
 				if strings.HasPrefix(line, "scheduler_mode:") {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "scheduler_mode:"))
 					v = strings.Trim(v, "\"'")
-					if v == schedulerModeCredits {
+					switch strings.ToLower(v) {
+					case schedulerModeCredits:
 						nextSchedulerMode = schedulerModeCredits
+					case schedulerModeWeighted:
+						nextSchedulerMode = schedulerModeWeighted
 					}
+				}
+				if strings.HasPrefix(line, "travel_auto:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "travel_auto:"))
+					v = strings.Trim(v, "\"'")
+					nextTravelAuto = v == "true" || v == "1" || v == "yes" || v == "on"
+				}
+				if strings.HasPrefix(line, "travel_hours:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "travel_hours:"))
+					nextTravelHours = strings.Trim(v, "\"'")
+				}
+				if strings.HasPrefix(line, "expiring_soon:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "expiring_soon:"))
+					v = strings.Trim(v, "\"'")
+					nextExpiringSoon = wbParseExpiringSoonDuration(v)
+				}
+				if strings.HasPrefix(line, "state_file:") {
+					v := strings.TrimSpace(strings.TrimPrefix(line, "state_file:"))
+					nextStateFile = strings.Trim(v, "\"'")
 				}
 				if strings.HasPrefix(line, "usage_report_url:") {
 					v := strings.TrimSpace(strings.TrimPrefix(line, "usage_report_url:"))
@@ -220,10 +254,6 @@ func configure(raw []byte) {
 	loginPlatform = nextLoginPlatform
 	loginPlatformMu.Unlock()
 
-	loginPlatformMu.Lock()
-	loginPlatform = nextLoginPlatform
-	loginPlatformMu.Unlock()
-
 	loginRegionMu.Lock()
 	loginRegion = nextLoginRegion
 	loginRegionMu.Unlock()
@@ -248,6 +278,18 @@ func configure(raw []byte) {
 	streamHeadTimeout = nextStreamHeadTimeout
 	streamHeadTimeoutMu.Unlock()
 
+	setWbTravelConfig(nextTravelAuto, nextTravelHours)
+	setExpiringSoonWindow(nextExpiringSoon)
+
+	// Cost-ledger state file (architecture ruling 2026-09-29): load the
+	// plugin-owned, TTL-filtered snapshot so cost tiers survive restarts. A
+	// rejected path or a load failure degrades to in-memory — never fatal and
+	// never pointed at credential data. state_file: off DETACHES any previously
+	// attached store (N2 second audit: it used to keep writing the old path).
+	wbApplyCostStateConfig(nextStateFile)
+	// Backstop state flush + sticky GC janitor (idempotent).
+	ensureWbRouterJanitor()
+
 	// management key: config_yaml > env > keep existing. Empty stays empty
 	// (plugin-layer auth disabled, host middleware still guards).
 	if nextMgmtKey == "" {
@@ -261,6 +303,27 @@ func configure(raw []byte) {
 	ensureScheduler()
 	// Migrate legacy codebuddy-cn auth files (merged plugin, v0.9.0).
 	startAdoption()
+}
+
+// wbApplyCostStateConfig (re)configures cost persistence from the raw
+// state_file config value. Enabled → attach a fresh store (loading the
+// TTL-filtered snapshot into the pool, newest observation wins per row).
+// Disabled/invalid → DETACH the current store so reconfigure cannot leave a
+// stale writer pointed at the old path (N2 second audit).
+func wbApplyCostStateConfig(raw string) {
+	path, enabled, reason := wbResolveCostStatePath(raw)
+	if !enabled {
+		wbRouterPool.detachCostStore()
+		log.Printf("workbuddy: cost persistence disabled — %s", reason)
+		return
+	}
+	if restored, err := wbRouterPool.attachCostStore(newWbCostStore(path, wbCostSaveInterval)); err != nil {
+		log.Printf("workbuddy: cost state %s unreadable (%v) — starting with in-memory observations", path, err)
+	} else if restored > 0 {
+		log.Printf("workbuddy: cost state %s restored %d observation(s)", path, restored)
+	} else {
+		log.Printf("workbuddy: cost state %s ready (no observations yet)", path)
+	}
 }
 
 // resolveUsageReport fills usageReportURL/key from config → env → secret files.

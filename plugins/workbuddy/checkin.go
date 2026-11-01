@@ -7,6 +7,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -34,50 +35,189 @@ func ensureScheduler() {
 // during its own runtime teardown, where touching Go sync primitives from the
 // plugin's c-shared runtime caused SIGSEGV on every restart.
 
-func nextCheckinTime(now time.Time) time.Time {
-	var earliest time.Time
-	// Consider both checkin and keepalive schedules so the timer wakes up for
-	// whichever fires first (e.g. 21:00 checkin vs 22:00 keepalive → 21:00 wins,
-	// then 22:00 keepalive fires on the next tick).
-	hours := append([]int{}, checkinHours...)
-	hours = append(hours, keepaliveHours...)
-	// Night-task slot (23:00): black_cat only scores inside the 23-08 window,
-	// so the scheduler tops it up after the evening checkin (v0.9.24).
-	hours = append(hours, growthNightTaskHours...)
-	for _, h := range hours {
-		t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
-		if !t.After(now) {
-			t = t.Add(24 * time.Hour) // slot already passed today → tomorrow
+// wbSchedulerWake is one planned scheduler wake: the instant plus the task
+// families scheduled for exactly that instant.
+//
+// S2 review fix (reference: workbuddy2api Scheduler.nextWake): a wake carries
+// the kinds it was planned for instead of running every family. Before this,
+// the loop ran runAutoCheckin() on every wake — including the four travel-only
+// slots (01/05/13/17 CST) — so the check-in tick ran up to six times a day
+// instead of the scheduled 09:00/21:00.
+type wbSchedulerWake struct {
+	At        time.Time
+	Checkin   bool
+	Keepalive bool
+	Travel    bool
+}
+
+type wbWakeKind int
+
+const (
+	wbWakeKindCheckin wbWakeKind = iota
+	wbWakeKindKeepalive
+	wbWakeKindTravel
+)
+
+func (w *wbSchedulerWake) mark(kind wbWakeKind) {
+	switch kind {
+	case wbWakeKindCheckin:
+		w.Checkin = true
+	case wbWakeKindKeepalive:
+		w.Keepalive = true
+	case wbWakeKindTravel:
+		w.Travel = true
+	}
+}
+
+// wbNextLocalHour returns today's h:00 local instant, or tomorrow's when it is
+// not strictly after now (same rule as the historical nextCheckinTime).
+func wbNextLocalHour(now time.Time, h int) time.Time {
+	t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+	if !t.After(now) {
+		t = t.Add(24 * time.Hour) // slot already passed today → tomorrow
+	}
+	return t
+}
+
+// wbJitterWindowMinutes bounds the randomized offset applied to a check-in
+// slot so the daily action does not land on the exact hour mark (owner
+// schedule ruling 2026-09-30: 00:05–00:15 CST window).
+const wbJitterWindowMinutes = 10
+
+// wbJitterMinutes draws the check-in slot's random offset (5–14 minutes).
+// Tests replace this seam with a deterministic value so wake arithmetic
+// stays exact; production keeps the live draw.
+var wbJitterMinutes = func() int {
+	return 5 + rand.Intn(wbJitterWindowMinutes)
+}
+
+// wbNextCheckinInstant returns the next check-in instant strictly after now:
+// the slot hour h:00 plus a random 5–15 minute offset. Same day-rollover
+// rule as wbNextLocalHour.
+func wbNextCheckinInstant(now time.Time, h int) time.Time {
+	t := time.Date(now.Year(), now.Month(), now.Day(), h, 0, 0, 0, now.Location())
+	t = t.Add(time.Duration(wbJitterMinutes()) * time.Minute)
+	if !t.After(now) {
+		t = t.Add(24 * time.Hour) // slot already passed today → tomorrow
+	}
+	return t
+}
+
+// wbNextSchedulerWake computes the next wake strictly after now and the task
+// families scheduled for that instant (reference nextWake semantics). Local
+// hour tables (check-in / keepalive) stay host-local; travel slots are
+// CST-anchored instants converted through wbNextTravelSlot, plus a one-second
+// margin so the timer lands at or after the slot instant.
+//
+// A zero At means every family is currently disabled; the loop idles instead
+// of spinning.
+func wbNextSchedulerWake(now time.Time) wbSchedulerWake {
+	var wake wbSchedulerWake
+	consider := func(t time.Time, kind wbWakeKind) {
+		if t.IsZero() {
+			return
 		}
-		if earliest.IsZero() || t.Before(earliest) {
-			earliest = t
+		switch {
+		case wake.At.IsZero() || t.Before(wake.At):
+			wake = wbSchedulerWake{At: t}
+			wake.mark(kind)
+		case t.Equal(wake.At):
+			wake.mark(kind)
 		}
 	}
-	return earliest
+	for _, h := range checkinHours {
+		consider(wbNextCheckinInstant(now, h), wbWakeKindCheckin)
+	}
+	for _, h := range keepaliveHours {
+		consider(wbNextLocalHour(now, h), wbWakeKindKeepalive)
+	}
+	// Independent travel slots (I6 parity: default 1,5,9,13,17,21 CST) are
+	// CST-anchored instants, not host-local hours: if the host clock is not in
+	// UTC+8, converting the hours into local time would drift the wake away
+	// from the slot (and out of the catch-up window). +1s guarantees the tick
+	// lands at or after the slot instant so wbTakeDueTravelSlot sees it.
+	if wbAutoTravelEnabled() {
+		if t := wbNextTravelSlot(now, wbTravelHours()); !t.IsZero() {
+			consider(t.Add(time.Second), wbWakeKindTravel)
+		}
+	}
+	return wake
+}
+
+// nextCheckinTime is the historical name kept for callers/tests; it returns
+// the next wake instant.
+//
+// Owner schedule ruling 2026-09-30: the check-in slot is the single midnight
+// window 00:05–00:15 (00:00 + random 5–15 min). The travel slots (1/5/9/13/
+// 17/21 CST) double as check-in RETRY wakes: wbDispatchSchedulerWake runs the
+// check-in pass on travel wakes too — runAutoCheckin's upstream check-in is
+// idempotent per day (already-checked-in is a harmless no-op), so a failed
+// midnight attempt recovers on the next travel wake. The travel wake is
+// deliberately NOT merged into this instant (the travel pass must fire at its
+// own slot), so tests assert the window on wbNextCheckinInstant directly.
+func nextCheckinTime(now time.Time) time.Time {
+	return wbNextSchedulerWake(now).At
 }
 
 func schedulerLoop(stop chan struct{}) {
 	for {
-		next := nextCheckinTime(time.Now())
-		timer := time.NewTimer(time.Until(next))
+		wake := wbNextSchedulerWake(time.Now())
+		if wake.At.IsZero() {
+			// Every family disabled (defensive: the hour tables are fixed and
+			// non-empty, so this only happens if a caller empties them). Idle
+			// instead of spinning; a stop signal still exits promptly.
+			select {
+			case <-stop:
+				return
+			case <-time.After(time.Hour):
+				continue
+			}
+		}
+		timer := time.NewTimer(time.Until(wake.At))
 		select {
 		case <-stop:
 			timer.Stop()
 			return
 		case <-timer.C:
-			runAutoCheckin()
-			// Fire keepalive if the current tick falls within its scheduled
-			// window (e.g. 22:00 keepalive fires on the 22:00 tick even though
-			// the previous checkin tick was 21:00).
-			if shouldRunKeepaliveNow(time.Now()) {
-				runTokenKeepalive()
-			}
-			// Night-task slot (23:00): top up black_cat while the 23-08 window
-			// is open; a no-op (window check) if the tick drifted past 08:00.
-			if shouldRunNightTaskNow(time.Now()) {
-				growthNightTaskTick()
-			}
+			wbDispatchSchedulerWake(wake, time.Now())
 		}
+	}
+}
+
+// Scheduler dispatch sinks — seams so tests can exercise wake dispatch without
+// network. Production values are the real implementations.
+var (
+	runAutoCheckinFn    = runAutoCheckin
+	runAutoTravelFn     = runAutoTravel
+	runTokenKeepaliveFn = runTokenKeepalive
+)
+
+// wbDispatchSchedulerWake runs exactly the task families the wake was planned
+// for, plus a due independent travel slot.
+//
+// Travel is attempted on every wake because wbTakeDueTravelSlot is itself
+// slot-deduplicated (slot key + bounded catch-up window), which also covers the
+// coincident case where a check-in wake is planned one second before the same
+// CST hour's travel instant. Keepalive runs only when planned.
+//
+// Check-in runs on check-in wakes AND on travel wakes (owner schedule ruling
+// 2026-09-30: the six travel slots double as daily check-in retries). The
+// upstream check-in is idempotent per day, so a travel-wake retry after a
+// successful midnight attempt is a harmless no-op — no duplicate credit, no
+// duplicate action. S2's "travel wake must not run check-in" constraint is
+// explicitly superseded by this owner ruling.
+func wbDispatchSchedulerWake(wake wbSchedulerWake, now time.Time) {
+	if wake.Checkin || wake.Travel {
+		runAutoCheckinFn()
+	}
+	// Fire keepalive when the current tick falls within its scheduled window
+	// (e.g. 22:00 keepalive fires on the 22:00 tick).
+	if wake.Keepalive && shouldRunKeepaliveNow(now) {
+		runTokenKeepaliveFn()
+	}
+	if slot, key, ok := wbTakeDueTravelSlot(now); ok {
+		log.Printf("travel: slot %s due (%s) — running travel pass", key, slot.Format(time.RFC3339))
+		runAutoTravelFn()
 	}
 }
 
@@ -96,10 +236,18 @@ func runAutoCheckin() {
 	if !doCheckin && !lifecycleEnabled() {
 		return
 	}
-	files, err := hostAuthList()
+	files, err := hostAuthListFn()
 	if err != nil {
 		return
 	}
+	// One upstream action per account: collapse the legacy + canonical copies
+	// before fan-out, canonical copy preferred (round-2 review). The per-pass
+	// guard inside processAutoCheckinAccount stays as a safety net.
+	if doCheckin {
+		files, _ = wbDedupedTargets(files)
+	}
+	// A-24: per-account work runs concurrently (sem=4).
+	seen := &wbAccountPassGuard{}
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, 4)
 	for _, f := range files {
@@ -109,7 +257,7 @@ func runAutoCheckin() {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			processAutoCheckinAccount(f, doCheckin)
+			processAutoCheckinAccount(f, doCheckin, seen)
 		}()
 	}
 	wg.Wait()
@@ -117,12 +265,23 @@ func runAutoCheckin() {
 
 // processAutoCheckinAccount handles one account's scheduled tick. Extracted so
 // runAutoCheckin can fan out per-account work without duplicating logic.
-func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
+func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool, seen *wbAccountPassGuard) {
 	// A-24: only fetch sa when needed (checkin). For lifecycle-only paths,
 	// let reconcileOneAccount do the single hostAuthGetBundle internally.
 	if doCheckin {
-		sa, err := hostAuthGet(f.AuthIndex)
+		sa, err := hostAuthGetFn(f.AuthIndex)
 		if err != nil {
+			return
+		}
+		// A deliberately removed (tombstoned) identity — or an untrusted
+		// tombstone store — is not acted on, even though its preserved legacy
+		// copy may still be listed (round-2/round-3 enforcement, fail-closed).
+		if wbTombstoneBlocksAuth(sa) {
+			return
+		}
+		// Legacy + canonical copies of one credential are one upstream account:
+		// act once per pass (second audit: doubled check-in app calls).
+		if !seen.first(sa) {
 			return
 		}
 		if isGlobalDomain(sa.Auth.Domain) {
@@ -141,6 +300,14 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 			}
 			return
 		}
+		// CN: the whole check-in + growth section runs under the unified
+		// per-account lock so it cannot race a manual check-in/task run or the
+		// travel pass (I3 review fix). The lock is keyed by account identity
+		// (uid × realm), so both copies of a duplicated credential serialize on
+		// ONE mutex (round-2 review). reconcileOneAccount below takes the same
+		// lock in its leaf writers, so it must stay OUTSIDE this section.
+		mu := wbAccountLockFor(f.AuthIndex, sa)
+		mu.Lock()
 		// CN: daily check-in when enabled.
 		ci, err := fetchCheckinStatus(sa)
 		if err == nil && ci != nil && ci.Active && !ci.TodayCheckedIn {
@@ -171,8 +338,11 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 		// (task center: report / makeup / accept / travel / redeem / lottery /
 		// claim). Gated by tasks_auto; failures are absorbed into its own
 		// summary and never affect the checkin flow above.
+		// Architect ruling 2026-09-29: no automatic loop travels — travel_auto
+		// off closes this entry too, and travel_auto on leaves travel to the
+		// independent six-slot pass.
 		if tasksAutoEnabled() {
-			if res := tasksDailyBonus(sa); res != nil {
+			if res := tasksDailyBonusModeFn(sa, autoTasksIncludeTravel()); res != nil {
 				for _, line := range res.Lines {
 					log.Printf("tasks %s: %s", f.AuthIndex, line)
 				}
@@ -191,6 +361,7 @@ func processAutoCheckinAccount(f pluginapi.HostAuthFileEntry, doCheckin bool) {
 			}
 			accountCache.Store(f.ID, entry)
 		}
+		mu.Unlock()
 		if lifecycleEnabled() {
 			_, _ = reconcileOneAccount(f.AuthIndex, f.ID, true)
 		}
@@ -222,7 +393,7 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 	authIndex := strings.TrimSpace(body.AuthIndex)
 	single := authIndex != ""
 
-	files, err := hostAuthList()
+	files, err := hostAuthListFn()
 	if err != nil {
 		return map[string]any{"error": err.Error()}
 	}
@@ -235,6 +406,16 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 	if len(targets) == 0 {
 		return map[string]any{"error": "no matching account"}
 	}
+	// Batch mode: legacy + canonical copies of one credential are one upstream
+	// account — check in once (second audit). Single-account mode is explicit:
+	// the caller named one credential, so it is never deduplicated.
+	duplicates := 0
+	if !single {
+		targets, duplicates = wbDedupedTargets(targets)
+		if len(targets) == 0 {
+			return map[string]any{"error": "no matching account"}
+		}
+	}
 
 	results := make([]map[string]any, len(targets))
 	var wg sync.WaitGroup
@@ -245,7 +426,7 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			results[i] = checkinOneAccount(f)
+			results[i] = checkinOneAccountFn(f)
 		}(i, f)
 	}
 	wg.Wait()
@@ -280,16 +461,21 @@ func handleManualCheckin(req pluginapi.ManagementRequest) map[string]any {
 	return map[string]any{
 		"results": results,
 		"summary": map[string]any{
-			"total":          len(targets),
-			"eligible":       eligibleN,
-			"success":        successN,
-			"already":        alreadyN,
-			"skipped_global": globalN,
-			"fail":           failN,
-			"attempted":      eligibleN,
+			"total":             len(targets),
+			"eligible":          eligibleN,
+			"success":           successN,
+			"already":           alreadyN,
+			"skipped_global":    globalN,
+			"skipped_duplicate": duplicates,
+			"fail":              failN,
+			"attempted":         eligibleN,
 		},
 	}
 }
+
+// checkinOneAccountFn is the per-account dispatch seam used by the batch
+// endpoint (tests count exactly one call per account).
+var checkinOneAccountFn = checkinOneAccount
 
 // checkinOneAccount performs the daily check-in for one account with the
 // minimum number of round-trips:
@@ -318,7 +504,7 @@ func checkinOneAccount(f pluginapi.HostAuthFileEntry) map[string]any {
 		return out
 	}
 
-	mu := checkinLockFor(f.AuthIndex)
+	mu := wbAccountLockFor(f.AuthIndex, sa)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -403,29 +589,30 @@ func mergeCheckinCache(authID string, ci *checkinSummary) {
 	accountCache.Store(authID, entry)
 }
 
-func checkinLockFor(authIndex string) *sync.Mutex {
-	v, _ := checkinLocks.LoadOrStore(authIndex, &sync.Mutex{})
-	return v.(*sync.Mutex)
-}
+// wbAccountLockSoftCap only surfaces pathological lock-table growth (the table
+// is expected to hold a handful to tens of entries per process).
+const wbAccountLockSoftCap = 512
 
-// pruneCheckinLocks removes lock entries for auth indices that no longer
-// exist in hostAuthList. Call after dashboard prune.
-// Lock keys are auth_index (used for host RPC), so live map needs auth_index too.
+// pruneCheckinLocks is intentionally a NO-OP this round.
+//
+// Round-2 review: every reclamation scheme here is racy — between
+// TryLock/Unlock (or LoadAndDelete) and the actual removal another goroutine can
+// acquire the old mutex, and the next pass would then create a PARALLEL mutex
+// for the same account, defeating the unified per-account serialization. Safe
+// reclamation needs refcounts/generation management (out of scope this round).
+//
+// The unified lock table therefore keeps one mutex per account identity or auth
+// record seen for the PROCESS lifetime. Growth is bounded by the auth set
+// (tens of entries), never by request volume; a new account adds one entry.
+// The function is kept (and called from the dashboard prune path) so the
+// behavior is explicit and the soft-cap warning remains.
 func pruneCheckinLocks() {
-	files, err := hostAuthList()
-	if err != nil {
-		return
-	}
-	live := make(map[string]struct{}, len(files))
-	for _, f := range files {
-		live[f.ID] = struct{}{}
-		live[f.AuthIndex] = struct{}{} // checkinLockFor uses auth_index as key
-	}
-	checkinLocks.Range(func(key, _ any) bool {
-		idx, _ := key.(string)
-		if _, ok := live[idx]; !ok {
-			checkinLocks.Delete(key)
-		}
+	n := 0
+	checkinLocks.Range(func(_, _ any) bool {
+		n++
 		return true
 	})
+	if n > wbAccountLockSoftCap {
+		log.Printf("workbuddy: account lock table holds %d entries (soft cap %d) — pruning is disabled (racy reclamation), investigate account churn", n, wbAccountLockSoftCap)
+	}
 }

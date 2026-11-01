@@ -53,6 +53,14 @@ func TestBillingHeaders_IntlRealm(t *testing.T) {
 		_, _ = w.Write([]byte(`{"code":0,"msg":"OK","data":{}}`))
 	}))
 	defer srv.Close()
+	// I6-WORKBUDDY-IMPL: point the Intl billing base at the stub. The test
+	// previously never overrode billingBaseIntl, so billingCallOnce dialed the
+	// real https://www.codebuddy.ai with a fake token and failed on EOF — a
+	// hermetic-test defect, not a product defect. billingBaseFor resolves the var
+	// at call time, so the override is enough.
+	oldBaseIntl := billingBaseIntl
+	billingBaseIntl = srv.URL
+	t.Cleanup(func() { billingBaseIntl = oldBaseIntl })
 
 	sa := &storedAuth{}
 	sa.Auth.Domain = "codebuddy.ai"

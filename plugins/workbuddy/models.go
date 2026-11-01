@@ -8,11 +8,14 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,15 +32,33 @@ import (
 // still advertised it, producing host-level "unknown provider" 400s that no
 // plugin log could explain. Static catalogs are gone on purpose —
 // advertisement mirrors discovery only, chat passes the client's model id
-// through verbatim, and models_cn / models_intl / models_global config pins
-// remain the explicit user override.
+// through verbatim, and models_intl / models_global config pins remain the
+// explicit user override.
+//
+// Round6 slice 3 (2026-09-30): models_cn is DEPRECATED. The per-realm cache
+// used to be a SINGLE SLOT — whichever credential discovered first owned the
+// realm's catalog, so two CN accounts with different upstream catalogs (live:
+// one missing kimi-k3-2 / glm-5.3-flashx / minimax-m3-pay) made models
+// flicker across restarts, and a models_cn pin was the workaround. The cache
+// is now the UNION of every credential's discovery (same-id dedupe,
+// case-insensitive; a credential that has never contributed discovers even
+// when the union is fresh; one account's failure never swallows the others).
+// models_cn is parsed for tolerance but ignored: remove the line from
+// config when convenient. models_global / models_intl pins keep their
+// existing semantics.
 
 // pinnedModelsForRealm returns the ModelInfo list pinned via config_yaml
-// models_cn / models_global / models_intl for this realm, or nil. Pinned
-// lists are authoritative: they replace discovery for that realm entirely,
-// so the credential output is exactly the user-written "supported models"
+// models_global / models_intl for this realm, or nil. Pinned lists are
+// authoritative: they replace discovery for that realm entirely, so the
+// credential output is exactly the user-written "supported models"
 // list (the v0.12.19 formalization of writing supported models into the
 // credential output).
+//
+// models_cn is NOT honored here anymore (round6 slice 3): the key is
+// DEPRECATED — parsed for tolerance, ignored for catalog generation — because
+// the CN catalog is now the cross-account discovery union (see the file-head
+// note). Only call this for realm != cn, or accept that a cn pin is dead
+// configuration.
 func pinnedModelsForRealm(realm string) []pluginapi.ModelInfo {
 	ids := pinnedModelIDsForRealm(realm)
 	if len(ids) == 0 {
@@ -110,8 +131,10 @@ func extractAccountUID(raw []byte) string {
 
 // fetchDynamicModelsFromStorage resolves ONE credential's advertised model
 // list, in priority order:
-//  1. the realm's pinned config (models_cn / models_global / models_intl) —
-//     the user-written "supported models" list, which also skips discovery;
+//  1. the realm's pinned config (models_global / models_intl; models_cn is
+//     DEPRECATED — parsed, ignored: the CN catalog is the cross-account
+//     discovery union) — the user-written "supported models" list, which
+//     also skips discovery;
 //  2. per-realm dynamic discovery: fresh answer > today's cache > stale
 //     cache (v0.12.18; stale-on-failure since v0.12.71);
 //  3. nothing — deliberate since v0.9.33. A hand-maintained static catalog
@@ -125,6 +148,10 @@ func extractAccountUID(raw []byte) string {
 // entry (source + count + failure reason) so the panel and logs answer
 // "why does this realm show these models" without guesswork. Discovery
 // failures log a throttled reason line (the pre-v0.9.9 path was silent).
+//
+// Round6 slice 3: the served catalog for a realm is the UNION of every
+// credential's successful discovery (see the file-head note) — not the last
+// single-slot answer.
 func fetchDynamicModelsFromStorage(storageJSON []byte) []pluginapi.ModelInfo {
 	list := fetchDynamicModelsFromStorageInner(storageJSON)
 	// v0.9.25: overlay runtime-learned alias→real display names on every
@@ -142,9 +169,15 @@ func fetchDynamicModelsFromStorageInner(storageJSON []byte) []pluginapi.ModelInf
 	}
 	uid := extractAccountUID(storageJSON)
 	realm := realmForStorage(storageJSON, accessToken)
-	if pinned := pinnedModelsForRealm(realm); len(pinned) > 0 {
-		noteRealmSource(realm, "pin", len(pinned))
-		return pinned
+	// Pin branch (models_global / models_intl only). models_cn is DEPRECATED:
+	// parsed for tolerance, ignored for catalog generation — the CN catalog is
+	// the cross-account discovery union now (file-head note). A cn pin here
+	// would resurrect the single-source divergence the union replaces.
+	if realm != regionCN {
+		if pinned := pinnedModelsForRealm(realm); len(pinned) > 0 {
+			noteRealmSource(realm, "pin", len(pinned))
+			return pinned
+		}
 	}
 	if accessToken == "" {
 		// v0.9.33: no token → no discovery possible, and the static catalog
@@ -152,47 +185,52 @@ func fetchDynamicModelsFromStorageInner(storageJSON []byte) []pluginapi.ModelInf
 		noteRealmSource(realm, "none (no token in storage)", 0)
 		return nil
 	}
-	if models, ok := cachedDynamicModels(realm); ok {
+	credKey := wbModelCredKey(storageJSON)
+	if models, ok := cachedUnionForCredential(realm, credKey); ok {
 		return models
 	}
 	dyn, err := discoverModelsFn(accessToken, realm, uid)
 	if err != nil {
-		noteRealmError(realm, err.Error())
-		if stale, ok := cachedDynamicModelsStale(realm); ok {
-			return stale
-		}
-		// v0.9.38: the in-memory stale cache died with any restart — the
-		// last-known-good catalog now also lives in the credential files.
-		// Serving it keeps the credential's models registered (the host
-		// UnregisterClients on a 0-model answer), so the panel's
-		// per-credential excluded-models editor never reads an empty
-		// registry after a restart or during an upstream outage.
-		if snap, ok := persistedSnapshotForStorage(storageJSON, realm); ok {
-			noteRealmSource(realm, "persisted snapshot", len(snap))
-			return snap
-		}
-		return nil
+		noteRealmError(realm, fmt.Sprintf("credential %s: %v", credKey, err))
+		noteCredentialDiscoveryFailure(realm, credKey)
+		return modelsDiscoveryFailureFallback(storageJSON, realm)
 	}
 	if len(dyn) == 0 {
-		noteRealmError(realm, "discovery payload had no user-facing models")
-		if stale, ok := cachedDynamicModelsStale(realm); ok {
-			return stale
-		}
-		// v0.9.38: empty payload ≙ discovery failure — same persisted
-		// fallback before giving up.
-		if snap, ok := persistedSnapshotForStorage(storageJSON, realm); ok {
-			noteRealmSource(realm, "persisted snapshot", len(snap))
-			return snap
-		}
-		return nil
+		noteRealmError(realm, fmt.Sprintf("credential %s: discovery payload had no user-facing models", credKey))
+		noteCredentialDiscoveryFailure(realm, credKey)
+		// v0.9.38: empty payload ≙ discovery failure — same fallback chain.
+		return modelsDiscoveryFailureFallback(storageJSON, realm)
 	}
-	storeDynamicModels(realm, dyn)
+	served := storeCredentialModels(realm, credKey, dyn)
 	// v0.9.38: stamp the last-known-good catalog into the credential file
 	// (raw list, pre learned-alias overlay — the overlay re-applies on every
-	// serve branch). Change-guarded inside; best-effort.
-	persistModelSnapshot(storageJSON, realm, dyn)
-	log.Printf("models: realm=%s discovery ok: %d model(s)", realm, len(dyn))
-	return dyn
+	// serve branch). Round6 slice 3: the stamped catalog is the realm UNION —
+	// what the runtime actually advertises — so every contributor's file
+	// carries a realm-complete restart fallback. Change-guarded inside;
+	// best-effort.
+	persistModelSnapshot(storageJSON, realm, served)
+	log.Printf("models: realm=%s discovery ok for %s: %d model(s); serving union of %d", realm, credKey, len(dyn), len(served))
+	return served
+}
+
+// modelsDiscoveryFailureFallback is the shared failure tail: serve the
+// realm's last-known union (stale-while-error, v0.12.71), then the persisted
+// snapshot (v0.9.38 restart resilience), then nothing (v0.9.33 honesty).
+func modelsDiscoveryFailureFallback(storageJSON []byte, realm string) []pluginapi.ModelInfo {
+	if stale, ok := cachedDynamicModelsStale(realm); ok {
+		return stale
+	}
+	// v0.9.38: the in-memory stale cache died with any restart — the
+	// last-known-good catalog now also lives in the credential files.
+	// Serving it keeps the credential's models registered (the host
+	// UnregisterClients on a 0-model answer), so the panel's
+	// per-credential excluded-models editor never reads an empty
+	// registry after a restart or during an upstream outage.
+	if snap, ok := persistedSnapshotForStorage(storageJSON, realm); ok {
+		noteRealmSource(realm, "persisted snapshot", len(snap))
+		return snap
+	}
+	return nil
 }
 
 // realmModelsState is the dashboard-facing snapshot of one realm's model
@@ -329,6 +367,134 @@ func storeDynamicModels(realm string, models []pluginapi.ModelInfo) {
 	dynamicModelsCache.Lock()
 	dynamicModelsCache.realms[realm] = realmModelsEntry{models: models, fetched: time.Now(), source: "discovery"}
 	dynamicModelsCache.Unlock()
+}
+
+// unionContributionMaxAge bounds how long an unreferenced credential's
+// contribution stays in the union. A deleted/disabled credential stops being
+// asked (no model.for_auth ever again), so without this its frozen
+// contribution would pin retired model ids into the catalog forever.
+const unionContributionMaxAge = 24 * time.Hour
+
+// wbModelCredKey identifies the credential a discovery contribution belongs
+// to: the account uid when the storage carries one (legacy + canonical
+// sibling copies of one upstream account share it, so the pair discovers
+// once), else a sha256 of the raw storage blob. The key never leaves the
+// process (cache key + log field only).
+func wbModelCredKey(storageJSON []byte) string {
+	if uid := strings.TrimSpace(extractAccountUID(storageJSON)); uid != "" {
+		return "uid:" + uid
+	}
+	sum := sha256.Sum256(storageJSON)
+	return "sha:" + hex.EncodeToString(sum[:8])
+}
+
+// storeCredentialModels records one credential's successful discovery and
+// rebuilds the realm's served catalog as the union of every contribution:
+//   - deterministic order (sorted credential keys — map iteration must not
+//     reshuffle the catalog);
+//   - same-id dedupe, case-insensitive (same rule as mergeDiscoveryLists);
+//     the first contributor in key order keeps its per-entry fields, so the
+//     display name is "any consistent one" (contributions of one upstream
+//     realm carry the same fields);
+//   - entries with nil models are failure markers and contribute nothing;
+//   - contributions older than unionContributionMaxAge are pruned.
+//
+// The rebuilt union is what every later serve path reads (cachedDynamicModels
+// / cachedDynamicModelsStale / modelHintForRealm), so the stale-while-error
+// and 11102 hint paths stay union-correct for free. Returns a copy of the
+// served union.
+func storeCredentialModels(realm, credKey string, models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	dynamicModelsCache.Lock()
+	defer dynamicModelsCache.Unlock()
+	entry := dynamicModelsCache.realms[realm]
+	if entry.creds == nil {
+		entry.creds = map[string]realmModelsContribution{}
+	}
+	entry.creds[credKey] = realmModelsContribution{models: models, at: time.Now()}
+	entry.rebuildUnionLocked(time.Now())
+	dynamicModelsCache.realms[realm] = entry
+	out := make([]pluginapi.ModelInfo, len(entry.models))
+	copy(out, entry.models)
+	return out
+}
+
+// noteCredentialDiscoveryFailure records a credential's failed discovery
+// attempt. The marker does not touch the served union (other accounts'
+// catalogs survive); it only gates the failing credential's retries to the
+// union TTL so a dead upstream is not hammered per models query — the same
+// cadence the single-slot cache had.
+func noteCredentialDiscoveryFailure(realm, credKey string) {
+	dynamicModelsCache.Lock()
+	defer dynamicModelsCache.Unlock()
+	entry := dynamicModelsCache.realms[realm]
+	if entry.creds == nil {
+		entry.creds = map[string]realmModelsContribution{}
+	}
+	entry.creds[credKey] = realmModelsContribution{models: nil, at: time.Now()}
+	dynamicModelsCache.realms[realm] = entry
+}
+
+// rebuildUnionLocked recomputes entry.models from the recorded contributions.
+// Caller holds dynamicModelsCache.Lock.
+func (e *realmModelsEntry) rebuildUnionLocked(now time.Time) {
+	keys := make([]string, 0, len(e.creds))
+	for k, c := range e.creds {
+		if c.models == nil {
+			continue // failure marker
+		}
+		if now.Sub(c.at) > unionContributionMaxAge {
+			delete(e.creds, k) // stale contributor (deleted credential) — prune
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	seen := make(map[string]bool)
+	var out []pluginapi.ModelInfo
+	for _, k := range keys {
+		for _, m := range e.creds[k].models {
+			if m.ID == "" {
+				continue
+			}
+			id := strings.ToLower(m.ID)
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, m)
+		}
+	}
+	e.models = out
+	e.fetched = now
+	e.source = "discovery"
+	if len(keys) > 1 {
+		e.source = fmt.Sprintf("discovery union (%d credentials)", len(keys))
+	}
+	e.srcCount = len(out)
+	// A successful rebuild is the realm's current truth — clear the failure
+	// reason (the per-credential marker keeps its own retry gate).
+	e.lastErr = ""
+	e.lastErrAt = time.Time{}
+}
+
+// cachedUnionForCredential reports whether the asking credential may skip
+// discovery and serve the realm's fresh union: the union is inside its TTL
+// AND this credential already has a recorded attempt (contribution or
+// TTL-gated failure marker) in it. A credential never heard from must
+// discover — the union only covers accounts it has actually heard from, and
+// that first ask is what grows the union to X∪Y. This replaces the
+// single-slot cachedDynamicModels short-circuit on the for_auth path.
+func cachedUnionForCredential(realm, credKey string) ([]pluginapi.ModelInfo, bool) {
+	dynamicModelsCache.RLock()
+	defer dynamicModelsCache.RUnlock()
+	entry, ok := dynamicModelsCache.realms[realm]
+	if !ok || len(entry.models) == 0 || time.Since(entry.fetched) >= dynamicModelsCacheTTL {
+		return nil, false
+	}
+	if _, tried := entry.creds[credKey]; !tried {
+		return nil, false
+	}
+	return entry.models, true
 }
 
 // realmForStorage classifies an auth storage blob into its upstream realm
@@ -1438,8 +1604,9 @@ func handleModelStatic(raw []byte) ([]byte, error) {
 	// upstream on 2026-09-22 while static tables still advertised it, which
 	// surfaced as host-level "unknown provider" 400s no plugin log could
 	// explain. All advertisement flows through model.for_auth discovery;
-	// models_cn / models_intl / models_global pins remain the explicit
-	// user override.
+	// models_intl / models_global pins remain the explicit user override
+	// (models_cn is deprecated — parsed, ignored: the CN catalog is the
+	// cross-account discovery union).
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: []pluginapi.ModelInfo{}})
 }
 
@@ -1457,6 +1624,15 @@ func handleModelForAuth(raw []byte) ([]byte, error) {
 	// v0.9.39: filter at BOTH granularities — the provider key (whole
 	// plugin) and this credential's realm sub-key (channel-scoped).
 	tok, _ := extractAccessToken(req.StorageJSON)
-	models = filterExcludedModelsForRealm(models, req.Host, realmForStorage(req.StorageJSON, tok))
+	realm := realmForStorage(req.StorageJSON, tok)
+	models = filterExcludedModelsForRealm(models, req.Host, realm)
+	// Issue #6 owner correction: this candidate advertises BARE upstream model
+	// names only — exactly what pin / fresh discovery / cache / stale /
+	// persisted snapshot resolves (v0.9.33: no static catalog, and the round4
+	// realm-prefixed variants are removed).
+	// Remember what this plugin advertises: the request interceptor's scope
+	// fence only touches models that provably route here (bare ID), so
+	// non-WorkBuddy traffic stays byte-identical.
+	wbRecordAdvertisedModels(models)
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: models})
 }

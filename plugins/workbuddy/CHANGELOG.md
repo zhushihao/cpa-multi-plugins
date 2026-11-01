@@ -1,5 +1,147 @@
 # Changelog
 
+## 0.9.47
+
+### Round6 slice 1: per-model effort clamp, night black_cat removal, priority preservation
+
+Owner decision 2026-09-30: removed the night black_cat top-up feature entirely
+(upstream activity ended), superseding the earlier plan to ship it behind a
+default-off `night_task_auto` switch. Check-in / keepalive / travel / growth
+task scheduling is untouched.
+
+Three live-bug fixes (Issue #6 round6 backlog), one red/green test cycle each.
+
+**Per-model reasoning-effort clamp.** The upstream rejects a `reasoning_effort`
+outside the resolved model's supported set (code 11150; hit live by a
+deepseek-v4.1-flash session on a rich-protocol ingress, which forwarded the
+client's dial verbatim). The payload path now clamps the dial to the model's
+supported set — deepseek-v4.1-flash / glm-5.3 / glm-5.3-flash /
+kimi-k2.8-preview: low/high/max; kimi-k3-2: low/high/xhigh; hy4-preview: high;
+hy3 / hy3-x: low/high. Exact support wins; otherwise the nearest level by rank
+(low<high<xhigh<max, with the wider minimal/medium dialects placed between) is
+picked, equidistant requests prefer the higher tier (never silently downgrade
+thinking), a request above the model's top tier clamps to that top tier (owner
+correction 2026-09-30: kimi-k3-2 "max" → "xhigh", not "high"), and low is the
+floor. Unknown dials, empty values and unknown models pass through unchanged
+(never invent a level). The clamp runs after forceMaxThinking, so the hy3/hy4
+pin semantics and the hy3/hy3-x low-keep are unchanged.
+
+black_cat top-up was the only automatic task family without a config key, so it
+ran by default (round5 deviation). It now has its own opt-in switch and fires
+the incumbent :3002 (`cat_enabled=false`), per the recorded Option A ruling.
+`tasks_auto` semantics for every other family are unchanged, and a manual
+POST /tasks/run still includes black_cat regardless of either toggle.
+
+**Top-level `priority` preservation.** The plugin's persistence rewrote every
+managed credential through its canonical key set and dropped the top-level
+`priority` written by the CPA panel / CPA-Manager-Plus / hand edits; the host's
+plugin-auth branch does not read the key from the file, so the next reload
+silently reset the credential to the default routing tier (shawn-primary /
+anyu-fallback reverted to balanced pooling). The save funnel now carries an
+existing on-disk priority forward on every rewrite (read before overwrite;
+caller-supplied values win; nothing invented), AuthParse surfaces the file's
+priority into the host auth record (`Attributes` — the host's routing
+`authPriority()` reads only that field), and the management import surface
+accepts an explicit priority from the imported payload.
+
+Tests: pipeline-level red test for the live 11150 shapes (deepseek + medium /
+xhigh / minimal clamp; reasoning_summary mirror kept), the full per-model
+matrix across all eight roster models incl. case/space-insensitive matching and
+unknown-dial / unknown-model pass-through, and forceMaxThinking interplay
+(hy3/hy3-x low kept, hy3 medium→high, hy4 low→high). Night gate: default-off
+gate (no account listing unless both switches are on), and the config_yaml
+parse (true/1/yes, absent→false reset, explicit false). Priority: save-funnel
+preservation through a real typed rebuild (incl. the model_cache-present path),
+caller-supplied value wins, no-source-no-invention, AuthParse Attributes echo
+(+ no invention), import-surface persistence (number and numeric string), and
+re-import keeps the on-disk value.
+
+## 0.9.46
+
+### Bare upstream model names only (Issue #6 owner correction)
+
+The 0.9.45 cn:/global:/intl: client-name namespace is removed outright — this
+candidate exposes and accepts BARE upstream model names only. The owner
+superseded the earlier cn:-compatibility decision (the incumbent :3002 serves
+the prefixed names; a candidate must not keep a dead compatibility layer), so
+this is a removal, not a compatibility bridge, and no static alias table
+replaces it.
+
+**Ingress.** A chat request whose model still carries a cn:/global:/intl:
+prefix is denied at this candidate with HTTP 400 (`invalid_request_error`, so
+the host classifies it as a client request failure, not a credential failure)
+— never stripped and never forwarded upstream. Every other name goes through
+the host `oauth-model-alias` table exactly as it did before the namespace
+existed; a colon that is not one of the removed namespaces stays upstream's
+business.
+
+**Advertisement.** `model.for_auth` returns the bare pin / fresh discovery /
+cache / stale / persisted-snapshot list only, with no prefixed variants. A
+client that keeps a `cn:` name therefore fails clearly at the provider that
+does not serve it instead of silently sharing scope and ledger entries with a
+differently routed provider name.
+
+**Internal paths.** The interceptor scope fence (`wbScopedModel`) and the cost
+ledger canonical key (`wbCostModelKey`) no longer recognize the namespace: a
+prefixed name is not this plugin's (no private-header leak toward the provider
+that does serve it), and the ledger key stays total and identity-preserving.
+Credential realm/identity handling (`realmForStorage`, per-realm discovery,
+pins and exclusions, auth identity, adoption) and the cost-attribution ledger
+itself are unchanged.
+
+Removed: `model_realm.go` and `model_realm_prefix_test.go` (round4).
+
+Tests: prefixed request denied at the candidate (case/space/empty-remainder
+table, HTTP 400 + `invalid_request_error`, alias resolution must not apply),
+bare names byte-identical (alias resolution, trimming, non-namespace colon ids
+pass through), bare-only advertisement at the `model.for_auth` boundary for CN
+and Intl credentials, bare-only scope fence at the interceptor boundary
+(prefixed request untouched, forged header still cleared), and the
+canonical-key table without namespace normalization.
+
+## 0.9.45
+
+> Superseded by 0.9.46: the cn:/global:/intl: namespace is removed; this
+> candidate serves bare upstream model names only.
+
+### cn: model names accepted and advertised (Issue #6 parity)
+
+The incumbent gateway (:3002) addresses every model by a realm-namespaced
+name (`cn:glm-5.3`, `cn:auto`, …), and existing consumers — including the
+ZCode provider registrations — are configured with those names. The plugin
+only stripped the namespace inside internal pool/ledger decisions, so a
+chat request for `cn:glm-5.3` failed host routing (the name was not in the
+registry), and once routed it would have reached upstream verbatim (400).
+
+**Ingress.** `cn:` / `global:` / `intl:` (case-insensitive) is resolved as a
+local namespace on both executor paths: the prefix is stripped and only the
+bare id is sent upstream, then the host `oauth-model-alias` table is applied
+as before. Unprefixed ids are byte-identical to the previous behavior. A
+malformed namespace fails closed with a clear 400 (`cn:`, `global:` with no
+id, or a namespace-shaped prefix that is not a served realm) instead of a
+silent passthrough — the error carries `invalid_request_error` so the host
+treats it as a client request failure, not a credential failure.
+
+**Advertisement.** `model.for_auth` now also advertises the realm's
+namespaced variants (`cn:<id>` for CN, `global:<id>`, `intl:<id>`) on top of
+whatever pin/discovery/cache/stale/persisted-snapshot list currently
+resolves, so enumerating clients see the names they can call and the host
+registry (which routes a request by its model name, per credential) picks
+the credentials of that realm. Still dynamic — no static catalog (v0.9.33).
+Bare ids keep their order and their slots; variants never duplicate or
+double-prefix an id, and the v0.9.25 learned alias→real display names carry
+over to the namespaced entries.
+
+Deliberate non-goal: :3002's static tier aliases (`cn:fast-model`,
+`cn:balanced-model`, `cn:default-1.1`, `cn:deep-model`, `cn:hy3-b/c`) are not
+resurrected — whether any is still in use is a separate owner decision.
+
+Tests: ingress resolution/fail-closed tables, advertisement expansion
+(per-realm, dedupe, no double-prefix, no input mutation, metadata/name
+carry-over), the learned-overlay non-regression, per-credential
+`model.for_auth` namespacing (CN vs Intl, no cross-realm leakage), and the
+scope fence now covering `intl:`.
+
 ## 0.9.44
 
 ### Login success now carries its own persistence guarantee

@@ -9,6 +9,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -70,10 +72,17 @@ func pruneLifecycleState() {
 
 // disableAuth writes disabled:true for a CN (or fallback) account.
 func disableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary, reason string) error {
-	mu := checkinLockFor(authIndex)
+	mu := wbAccountLockFor(authIndex, sa)
 	mu.Lock()
 	defer mu.Unlock()
+	return disableAuthLocked(authIndex, authID, sa, cr, reason)
+}
 
+// disableAuthLocked is disableAuth without taking the per-account lock: the
+// caller already holds the unified per-account lock. Used by the delete path's
+// fail-closed fallback (architect ruling 2026-09-29: without a verified
+// tombstone the credential must be disabled instead of deleted).
+func disableAuthLocked(authIndex, authID string, sa *storedAuth, cr *creditsSummary, reason string) error {
 	note := displayNote(sa, cr, true)
 	if reason != "" && !strings.Contains(note, reason) {
 		// keep note short; reason only if room
@@ -85,7 +94,10 @@ func disableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary, r
 		return nil
 	}
 	// Prefer live physical file to preserve any extra fields if present.
-	phys, err := hostAuthGetPhysical(authIndex)
+	// Round-2 review: the read goes through the test seam (consistency with the
+	// delete path) and resolveAuthFileTarget verifies the physical identity
+	// before reusing the host-reported file name.
+	phys, err := hostAuthGetPhysicalFn(authIndex)
 	if err == nil && parseDisabledFromAuthJSON(phys.JSON) {
 		// already disabled; still refresh note if needed
 		if lifecycleStateUnchanged(authID, true, note) {
@@ -102,7 +114,7 @@ func disableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary, r
 	if err != nil {
 		return err
 	}
-	if err := hostAuthPersistMigrate(name, path, legacyPath, raw); err != nil {
+	if err := hostAuthPersistMigrateFn(name, path, legacyPath, raw); err != nil {
 		return err
 	}
 	rememberLifecycleState(authID, true, note)
@@ -112,7 +124,7 @@ func disableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary, r
 
 // reenableAuth writes disabled:false when CN has credits again.
 func reenableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary) error {
-	mu := checkinLockFor(authIndex)
+	mu := wbAccountLockFor(authIndex, sa)
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -123,7 +135,7 @@ func reenableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary) 
 	if lifecycleStateUnchanged(authID, false, note) {
 		return nil
 	}
-	phys, err := hostAuthGetPhysical(authIndex)
+	phys, err := hostAuthGetPhysicalFn(authIndex)
 	name := authFileNameFor(sa)
 	path := ""
 	legacyPath := ""
@@ -143,24 +155,52 @@ func reenableAuth(authIndex, authID string, sa *storedAuth, cr *creditsSummary) 
 }
 
 // deleteAuth removes Global exhausted credentials from disk.
+//
+// Round-2 review guards:
+//   - the physical target is read and verified UNDER the shared adopt/delete
+//     mutex, so an in-process adoption cannot change the target between the
+//     verification read and the delete (external host operations are outside
+//     this mutex and remain a documented boundary);
+//   - the physical credential must parse and carry the SAME identity (uid ×
+//     realm) as the requested sa, otherwise the delete fails closed (never
+//     delete another account's credential, never tombstone the wrong account);
+//   - a preserved legacy codebuddy-cn / codebuddy-intl SOURCE is never a delete
+//     target (I6: old credential files are read-only rollback material);
+//   - the tombstone is durably recorded and read back verified before the
+//     deletion; any failure disables instead (fail-closed);
+//   - the dual-named legacy copy is always preserved (only reported).
 func deleteAuth(authIndex, authID string, sa *storedAuth) error {
-	mu := checkinLockFor(authIndex)
+	mu := wbAccountLockFor(authIndex, sa)
 	mu.Lock()
 	defer mu.Unlock()
 
-	phys, err := hostAuthGetPhysical(authIndex)
+	wbAdoptDeleteMu.Lock()
+	defer wbAdoptDeleteMu.Unlock()
+
+	// Seam-based read (hostAuthGetPhysicalFn defaults to hostAuthGetPhysical)
+	// so the credential-preservation tests can drive this path offline.
+	phys, err := hostAuthGetPhysicalFn(authIndex)
 	if err != nil {
 		return err
 	}
+	// The physical document is authoritative for what would actually be
+	// removed: verify it before touching anything.
+	physSA, perr := parseStored(phys.JSON)
+	if perr != nil || physSA == nil {
+		log.Printf("workbuddy: refusing to delete auth index %s: physical credential unreadable (%v)", authIndex, perr)
+		return fmt.Errorf("delete refused: physical credential unreadable: %v", perr)
+	}
+	wantKey := wbAuthIdentityOf(sa).key()
+	targetKey := wbAuthIdentityOf(physSA).key()
+	if wantKey == "" || targetKey == "" || wantKey != targetKey {
+		log.Printf("workbuddy: refusing to delete auth index %s: requested identity %q != physical identity %q", authIndex, wantKey, targetKey)
+		return fmt.Errorf("delete refused: credential identity mismatch (requested %q, physical %q)", wantKey, targetKey)
+	}
+
 	path := strings.TrimSpace(phys.Path)
 	if path == "" {
 		// Try to reconstruct path from peer workbuddy files' directory + canonical name.
-		name := authFileNameFor(sa)
-		if phys.Name != "" && !isLegacyWorkbuddyAuthName(phys.Name) {
-			name = phys.Name
-		} else if strings.TrimSpace(phys.Name) != "" && isLegacyWorkbuddyAuthName(phys.Name) {
-			name = authFileNameFor(sa)
-		}
+		name, _, _ := resolveAuthFileTarget(sa, phys)
 		if dir := peerAuthDir(); dir != "" && name != "" {
 			candidate := filepath.Join(dir, name)
 			if isSafeWorkbuddyAuthPath(candidate) {
@@ -175,11 +215,8 @@ func deleteAuth(authIndex, authID string, sa *storedAuth) error {
 		if berr != nil {
 			return fmt.Errorf("no path and build failed: %w", berr)
 		}
-		name := authFileNameFor(sa)
-		if phys.Name != "" && !isLegacyWorkbuddyAuthName(phys.Name) {
-			name = phys.Name
-		}
-		if err := hostAuthPersistMigrate(name, "", "", raw); err != nil {
+		name, _, _ := resolveAuthFileTarget(sa, phys)
+		if err := hostAuthPersistMigrateFn(name, "", "", raw); err != nil {
 			return err
 		}
 		rememberLifecycleState(authID, true, note)
@@ -187,29 +224,67 @@ func deleteAuth(authIndex, authID string, sa *storedAuth) error {
 		clearActiveAuthIfMatch(authID)
 		return nil
 	}
-	if err := deleteAuthFileInDir(path, filepath.Dir(path)); err != nil {
-		return err
+	// A preserved legacy source is never deleted (I6 policy). The canonical
+	// copy is the only delete target this path may touch.
+	if base := strings.ToLower(filepath.Base(path)); isLegacyCodebuddyAuthName(base) || isLegacyCodebuddyIntlAuthName(base) || isLegacyWorkbuddyAuthName(base) {
+		log.Printf("workbuddy: refusing to delete preserved legacy source %s (I6 policy)", path)
+		return fmt.Errorf("delete refused: %s is a preserved legacy credential source", path)
 	}
-	// Also remove legacy workbuddy.json if this UID was dual-named historically.
-	if sa != nil && strings.TrimSpace(sa.Account.UID) != "" {
-		if dir := filepath.Dir(path); dir != "" {
-			legacy := filepath.Join(dir, authFileName)
-			// A-36: same path safety as primary deleteAuthFileInDir.
-			if isLegacyWorkbuddyAuthName(filepath.Base(legacy)) {
-				_ = deleteAuthFileInDir(legacy, dir)
-			}
-		}
+	// N1 (architect ruling 2026-09-29): the deletion is only allowed after the
+	// removal is durably recorded and read back verified. Any failure (tombstone
+	// off/corrupt/future schema/path/permission/write/read-back) fails CLOSED:
+	// the credential is disabled instead of deleted, so it leaves routing
+	// without becoming resurrectable from a preserved legacy source.
+	recordErr := wbRecordDeletionTombstone(physSA, filepath.Base(path))
+	if recordErr != nil {
+		log.Printf("workbuddy: refusing to delete %s: %v — disabling instead (fail-closed)", path, recordErr)
+		return disableAuthLocked(authIndex, authID, sa, nil, "删除需 tombstone 但不可持久化")
 	}
+	if delErr := deleteAuthFileInDir(path, filepath.Dir(path)); delErr != nil {
+		return delErr
+	}
+	preserveLegacyDualName(filepath.Dir(path), sa)
 	lifecycleState.Delete(authID)
 	accountCache.Delete(authID)
 	clearActiveAuthIfMatch(authID)
 	return nil
 }
 
+// removeLegacyDualName removes <dir>/workbuddy.json ONLY when it is provably
+// the same credential as the account being deleted (same non-empty UID).
+//
+// I6 credential-preservation policy: the bare legacy name carries no UID, so
+// the old unconditional cleanup could destroy a DIFFERENT account's credential
+// sharing the directory. Under the non-destructive migration both names may
+// exist for one UID, so the dual-named copy must still be removed together
+// with its account (otherwise an exhausted Global account would reappear on
+// the next reload) — but only after reading the file and matching the UID.
+// preserveLegacyDualName reports the dual-named legacy copy after a delete.
+//
+// Round-2 review (I6 preservation-first): this used to DELETE <dir>/workbuddy.json
+// when it carried the same UID, which contradicted the non-destructive policy
+// stated in authfile.go — the old file is rollback material for :3002 and is
+// never rewritten or deleted automatically. The canonical file is the only
+// delete target; the legacy copy stays byte-identical. Retiring it is an
+// operator decision after the staged cutover.
+func preserveLegacyDualName(dir string, sa *storedAuth) {
+	if sa == nil || strings.TrimSpace(dir) == "" {
+		return
+	}
+	legacy := filepath.Join(dir, authFileName)
+	if !isLegacyWorkbuddyAuthName(filepath.Base(legacy)) {
+		return
+	}
+	if st, err := os.Stat(legacy); err == nil && !st.IsDir() {
+		log.Printf("lifecycle: legacy dual-named copy %s preserved in place (I6: old credential files are never rewritten or deleted)", legacy)
+	}
+}
+
 // peerAuthDir returns the directory of any workbuddy auth file known to the host.
 // Uses HostAuthFileEntry.Path from the list response (A-38: was N+1 — list + getPhysical per file).
+// Seam-based (hostAuthListFn) so path-safety tests can run offline.
 func peerAuthDir() string {
-	files, err := hostAuthList()
+	files, err := hostAuthListFn()
 	if err != nil {
 		return ""
 	}
@@ -277,7 +352,7 @@ func syncAuthNote(authIndex, authID string, sa *storedAuth, cr *creditsSummary, 
 	if lifecycleStateUnchanged(authID, disabled, base) {
 		return nil
 	}
-	mu := checkinLockFor(authIndex)
+	mu := wbAccountLockFor(authIndex, sa)
 	mu.Lock()
 	defer mu.Unlock()
 	phys, err := hostAuthGetPhysicalFn(authIndex)
@@ -316,9 +391,16 @@ func reconcileOneAccount(authIndex, authID string, force bool) (action lifecycle
 	}
 	// Single host.auth.get (A-19): previous hostAuthGet + hostAuthGetPhysical
 	// doubled RPC on every reconcile tick (21 accounts × 2).
-	sa, phys, err := hostAuthGetBundle(authIndex)
+	sa, phys, err := hostAuthGetBundleFn(authIndex)
 	if err != nil {
 		return lifecycleNone, err
+	}
+	// A deliberately removed (tombstoned) identity — or an untrusted tombstone
+	// store — is not reconciled: retrying its deletion would loop forever and
+	// must never touch a preserved copy (round-2/round-3 enforcement,
+	// fail-closed). A verified re-import/login clears the record.
+	if wbTombstoneBlocksAuth(sa) {
+		return lifecycleNone, nil
 	}
 	disabled := false
 	if phys != nil {

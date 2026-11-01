@@ -1,8 +1,7 @@
 // task_chat_test.go covers the real-conversation task layer: event-builder
 // shapes (expert summon / actual-use / skill_info), server-requestId
 // extraction from SSE with the watermark scanner, model-aligned reporting,
-// the action-table completion (13 fingerprint + 6 chat = 19), expert-batch
-// deficit awareness, and the black_cat night-window gating.
+// and the action-table completion (13 fingerprint + 5 chat = 18).
 package main
 
 import (
@@ -15,38 +14,6 @@ import (
 	"testing"
 	"time"
 )
-
-func TestGrowthInNightWindow(t *testing.T) {
-	cases := []struct {
-		hour int
-		want bool
-	}{
-		{22, false}, {23, true}, {0, true}, {7, true}, {8, false}, {12, false},
-	}
-	for _, c := range cases {
-		now := time.Date(2026, 9, 20, c.hour, 30, 0, 0, time.Local)
-		if got := growthInNightWindow(now); got != c.want {
-			t.Errorf("hour %d: night window = %v, want %v", c.hour, got, c.want)
-		}
-	}
-}
-
-func TestShouldRunNightTaskNow(t *testing.T) {
-	// [23:00, 24:00) window; 00:30 next day is NOT (only the 23 slot fires).
-	at := func(h, m int) time.Time { return time.Date(2026, 9, 20, h, m, 0, 0, time.Local) }
-	if !shouldRunNightTaskNow(at(23, 0)) {
-		t.Error("23:00 should fire the night slot")
-	}
-	if !shouldRunNightTaskNow(at(23, 59)) {
-		t.Error("23:59 should fire the night slot")
-	}
-	if shouldRunNightTaskNow(at(22, 59)) {
-		t.Error("22:59 must not fire the night slot")
-	}
-	if shouldRunNightTaskNow(at(0, 30)) {
-		t.Error("00:30 must not fire the night slot (slot is 23:xx only)")
-	}
-}
 
 func TestGrowthServerIDRe(t *testing.T) {
 	yes := []string{"cmb-0123456789abcdef0123456789abcdef", "0123456789abcdef0123456789abcdef"}
@@ -277,7 +244,7 @@ func TestChatTaskTableComplete(t *testing.T) {
 	for _, a := range growthAutoActions {
 		seen[a.Code] = true
 	}
-	for _, code := range []string{"Model_chat_GLM5.2", "skill_1", "expert_5", "Expert_team_use_3", "Expert_lighthouse", "black_cat"} {
+	for _, code := range []string{"Model_chat_GLM5.2", "skill_1", "expert_5", "Expert_team_use_3", "Expert_lighthouse"} {
 		if !seen[code] {
 			t.Errorf("chat action %s missing from growthAutoActions", code)
 		}
@@ -285,8 +252,8 @@ func TestChatTaskTableComplete(t *testing.T) {
 			t.Errorf("%s must not be an mp task", code)
 		}
 	}
-	if len(growthAutoActions) != 19 {
-		t.Errorf("auto-light table = %d actions, want 19 (13 fingerprint + 6 chat)", len(growthAutoActions))
+	if len(growthAutoActions) != 18 {
+		t.Errorf("auto-light table = %d actions, want 18 (13 fingerprint + 5 chat)", len(growthAutoActions))
 	}
 }
 
@@ -324,54 +291,6 @@ func TestExpertBatchDeficitAware(t *testing.T) {
 	}
 	if usedUses != 2 {
 		t.Errorf("expert_actual_use reports = %d, want 2", usedUses)
-	}
-}
-
-func TestBlackCatWindowGateAndDeficit(t *testing.T) {
-	oldGap, oldFn := growthNightChatGap, growthNightWindowFn
-	growthNightChatGap = 0
-	defer func() { growthNightChatGap, growthNightWindowFn = oldGap, oldFn }()
-
-	sa := &storedAuth{Auth: storedTokens{AccessToken: "tok"}}
-	taskJSON := `{"code":0,"data":{"tasks":[{"task_code":"black_cat","accept_status":"accepted","current":1,"target":3}]}}`
-	s := newChatTaskSrv(t, taskJSON)
-	restore := setGrowthChatBase(s.srv.URL)
-	defer restore()
-	restoreG := setGrowthBase(s.srv.URL)
-	defer restoreG()
-	restoreB := setBillingBase(s.srv.URL)
-	defer restoreB()
-
-	// Outside the window: no chat quota consumed, informative no-error line.
-	growthNightWindowFn = func() bool { return false }
-	msg, err := runAutoBlackCat(sa)
-	if err != nil {
-		t.Fatalf("outside window: %v", err)
-	}
-	if !strings.Contains(msg, "23:00") {
-		t.Errorf("outside-window line = %q", msg)
-	}
-	if s.chatHits() != 0 {
-		t.Errorf("outside window consumed %d chats", s.chatHits())
-	}
-
-	// Inside the window: deficit = 3-1 = 2 glm-5.2 chats + 2 aligned reports.
-	growthNightWindowFn = func() bool { return true }
-	if _, err = runAutoBlackCat(sa); err != nil {
-		t.Fatalf("inside window: %v", err)
-	}
-	if s.chatHits() != 2 {
-		t.Errorf("chat hits = %d, want 2 (deficit)", s.chatHits())
-	}
-	s.mu.Lock()
-	lastChat := s.chatBodies[len(s.chatBodies)-1]
-	reports := s.reports
-	s.mu.Unlock()
-	if !strings.Contains(lastChat, `"model":"glm-5.2"`) {
-		t.Errorf("black_cat chat model wrong: %s", lastChat)
-	}
-	if reports < 2 {
-		t.Errorf("reports = %d, want >= 2", reports)
 	}
 }
 
@@ -462,16 +381,23 @@ func TestMarketExpertListParse(t *testing.T) {
 }
 
 func TestNightTickRegistrations(t *testing.T) {
-	// The scheduler wakes for the earliest slot: from 20:00 that's 21:00.
-	now := time.Date(2026, 9, 20, 20, 0, 0, 0, time.Local)
-	next := nextCheckinTime(now)
-	if h := next.Hour(); h != 21 {
-		t.Errorf("nextCheckinTime from 20:00 = %02d:%02d, want 21:00 first", h, next.Minute())
+	// I6 schedule ruling (2026-09-30): the check-in slot is the single
+	// midnight window 00:05–00:15 (night black_cat removed with the upstream
+	// activity ending; 21:00 slot dropped). Asserted on the raw check-in
+	// planner (wbNextCheckinInstant) — the full wake is the union with
+	// keepalive/travel and is covered by scheduler_wake tests.
+	withAutoTravelDisabled(t)
+	withCheckinHours(t, 0)
+	// From 02:00 the next check-in instant is the midnight window (next day).
+	now := time.Date(2026, 9, 20, 2, 0, 0, 0, time.UTC)
+	next := wbNextCheckinInstant(now, 0)
+	if h, m := next.Hour(), next.Minute(); h != 0 || m != 0 || next.Day() != 21 {
+		t.Errorf("check-in instant from 02:00 = %02d:%02d day %d, want 00:00 (jitter pinned)", h, m, next.Day())
 	}
-	// After the evening jobs the next wake must be the 23:00 night slot.
-	now = time.Date(2026, 9, 20, 22, 30, 0, 0, time.Local)
-	next = nextCheckinTime(now)
-	if h, m := next.Hour(), next.Minute(); h != 23 || m != 0 {
-		t.Errorf("nextCheckinTime from 22:30 = %02d:%02d, want 23:00", h, m)
+	// From 00:20 (window passed) the same window tomorrow is due.
+	now = time.Date(2026, 9, 20, 0, 20, 0, 0, time.UTC)
+	next = wbNextCheckinInstant(now, 0)
+	if h, m := next.Hour(), next.Minute(); h != 0 || m != 0 || next.Day() != 21 {
+		t.Errorf("check-in instant from 00:20 = %02d:%02d day %d, want 00:00 next day (jitter pinned)", h, m, next.Day())
 	}
 }
