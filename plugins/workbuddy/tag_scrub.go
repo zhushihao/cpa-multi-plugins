@@ -29,7 +29,11 @@
 //     (<details><summary>…) and code fences are never touched.
 //   - Fail-open: an unterminated block, a divergence, or the 1 MB hold cap
 //     releases the buffer verbatim (pre-fix behavior) instead of eating the
-//     answer or stalling the stream.
+//     answer or stalling the stream. The same rule covers the ALL-BLOCKS
+//     output: when the leading run constitutes the whole content (ZCode's
+//     compact prompt asks for "an <analysis> block followed by a <summary>
+//     block"), the run is flushed back verbatim — stripping it would hand
+//     the client empty text and loop compaction retries.
 //   - Mid-content blocks are left alone: a summary/thought block appearing
 //     after real content is overwhelmingly real content (HTML tutorials),
 //     and stripping there would require balancing risk we cannot verify
@@ -58,9 +62,10 @@ const tagScrubHoldLimit = 1 << 20
 // strippable tag blocks or real content. Zero value is ready to use; one
 // instance per choice per stream.
 type thoughtTagScrubber struct {
-	buf      string // held-back bytes not yet released (only while undecided)
-	decided  bool   // true once real content started (or fail-open tripped) — pass-through forever
-	scrubbed bool   // at least one block was removed (observability / tests)
+	buf         string // held-back bytes not yet released (only while undecided)
+	strippedRun string // original bytes of the leading blocks stripped so far — released by flush when the run constitutes the whole output
+	decided     bool   // true once real content started (or fail-open tripped) — pass-through forever
+	scrubbed    bool   // at least one block was removed (observability / tests)
 }
 
 func newThoughtTagScrubber() *thoughtTagScrubber { return &thoughtTagScrubber{} }
@@ -82,6 +87,7 @@ func (s *thoughtTagScrubber) feed(fragment string) string {
 	if len(s.buf) > tagScrubHoldLimit {
 		out := s.buf
 		s.buf = ""
+		s.strippedRun = ""
 		s.decided = true
 		return out
 	}
@@ -92,12 +98,24 @@ func (s *thoughtTagScrubber) feed(fragment string) string {
 // the fail-open path for an unterminated leading block (stream cut mid-
 // thought, finish_reason=length) — the client sees the raw tail exactly as
 // it would have pre-fix, instead of losing it.
+//
+// If the leading run constituted the ENTIRE output — nothing held back after
+// stripping (ZCode's compact prompt literally asks for "an <analysis> block
+// followed by a <summary> block") — releasing the buffer alone would hand the
+// client empty text and loop compaction retries forever. The stripped run is
+// released verbatim instead, tags included: leaking taught tags beats losing
+// the only content there is. Any leftover byte (even bare whitespace) keeps
+// the normal stripping semantics.
 func (s *thoughtTagScrubber) flush() string {
 	if s.decided {
 		return ""
 	}
 	out := s.buf
+	if out == "" {
+		out = s.strippedRun
+	}
 	s.buf = ""
+	s.strippedRun = ""
 	s.decided = true
 	return out
 }
@@ -120,7 +138,10 @@ func (s *thoughtTagScrubber) consume() (string, bool) {
 		}
 		if b[j] != '<' {
 			// Real content begins: the run is over, release everything
-			// (including the leading whitespace) verbatim.
+			// (including the leading whitespace) verbatim. The stripped
+			// run stays stripped — fail-open release is only for the
+			// all-blocks case.
+			s.strippedRun = ""
 			return b, true
 		}
 		name, hdrLen, ambiguous := matchScrubTagOpen(b[j:])
@@ -135,6 +156,7 @@ func (s *thoughtTagScrubber) consume() (string, bool) {
 				s.buf = b // inside an open block; keep buffering (cap guarded)
 				return "", false
 			}
+			s.strippedRun += b[:j+hdrLen+end+closeLen] // leading whitespace rides along for the all-blocks fail-open
 			b = rest[end+closeLen:]
 			s.scrubbed = true
 			continue
@@ -147,11 +169,13 @@ func (s *thoughtTagScrubber) consume() (string, bool) {
 			return "", false
 		}
 		if dsmlLen > 0 {
+			s.strippedRun += b[:j+dsmlLen]
 			b = b[j+dsmlLen:]
 			s.scrubbed = true
 			continue
 		}
 
+		s.strippedRun = ""
 		return b, true // '<' that opens none of our tags: real content
 	}
 }

@@ -441,3 +441,44 @@ func TestThoughtTagScrubber_EarliestClosingWinsOverCodeExample(t *testing.T) {
 		}
 	}
 }
+
+func TestThoughtTagScrubber_AllBlocksRunFlushesOriginal(t *testing.T) {
+	// ZCode compact prompt: "an <analysis> block followed by a <summary>
+	// block". When the leading run is the ENTIRE output, stripping would eat
+	// the whole answer — the run is flushed back verbatim, tags included.
+	in := "<analysis>\nwork in progress notes\n</analysis>\n\n<summary>\nthe compact summary\n</summary>"
+	if got := feedAll(t, []string{in}); got != in {
+		t.Fatalf("all-blocks output must flush back verbatim: %q", got)
+	}
+}
+
+func TestThoughtTagScrubber_SingleBlockOnlyFlushesOriginal(t *testing.T) {
+	in := "<summary>only a summary, no answer behind it</summary>"
+	if got := feedAll(t, []string{in}); got != in {
+		t.Fatalf("single-block-only output must flush back verbatim: %q", got)
+	}
+}
+
+func TestThoughtTagScrubber_SplitChunksAllBlocks(t *testing.T) {
+	in := "<analysis>part one</analysis>\n<summary>part two</summary>"
+	frags := []string{"<analysis>part ", "one</analysis>\n<sum", "mary>part two</summary>"}
+	if got := feedAll(t, frags); got != in {
+		t.Fatalf("split all-blocks output must flush back verbatim: %q", got)
+	}
+}
+
+func TestThoughtTagScrubber_StrippedRunDiscardedWhenContentFollows(t *testing.T) {
+	// Regression: real content after the run keeps the normal stripping
+	// semantics — the verbatim release is only for the all-blocks case.
+	got := feedAll(t, []string{"<summary>a</summary><analysis>b</analysis>real"})
+	if got != "real" {
+		t.Fatalf("blocks before real content must stay stripped: %q", got)
+	}
+}
+
+func TestThoughtTagScrubber_DSMLOnlyOutputFlushesOriginal(t *testing.T) {
+	in := "<｜｜DSML｜｜ calls></｜｜DSML｜｜ calls>"
+	if got := feedAll(t, []string{in}); got != in {
+		t.Fatalf("DSML-only output must flush back verbatim: %q", got)
+	}
+}
