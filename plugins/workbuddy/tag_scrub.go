@@ -128,19 +128,84 @@ func (s *thoughtTagScrubber) consume() (string, bool) {
 			s.buf = b // compact, then wait for more bytes
 			return "", false
 		}
-		if name == "" {
-			return b, true // '<' that opens none of our tags: real content
+		if name != "" {
+			rest := b[j+hdrLen:]
+			end, closeLen := findScrubTagClose(rest, name)
+			if end < 0 {
+				s.buf = b // inside an open block; keep buffering (cap guarded)
+				return "", false
+			}
+			b = rest[end+closeLen:]
+			s.scrubbed = true
+			continue
 		}
-		rest := b[j+hdrLen:]
-		end := strings.Index(rest, "</"+name+">")
-		if end < 0 {
-			s.buf = b // inside an open block; keep buffering (cap guarded)
+
+		// Also check leading standalone DSML tags (e.g. consecutive closing tags across chunks)
+		dsmlLen, dsmlAmbiguous := matchDSMLTag(b[j:])
+		if dsmlAmbiguous {
+			s.buf = b
 			return "", false
 		}
-		b = rest[end+len(name)+3:]
-		s.scrubbed = true
-		// Loop: consecutive blocks (whitespace-separated) are also stripped.
+		if dsmlLen > 0 {
+			b = b[j+dsmlLen:]
+			s.scrubbed = true
+			continue
+		}
+
+		return b, true // '<' that opens none of our tags: real content
 	}
+}
+
+var dsmlTags = []string{
+	"</｜｜DSML｜｜ parameter>",
+	"</｜｜DSML｜｜ invoke>",
+	"</｜｜DSML｜｜ calls>",
+	"<｜｜DSML｜｜ calls>",
+	"<｜｜DSML｜｜ invoke>",
+	"<｜｜DSML｜｜ parameter>",
+	"<｜tool calls begin｜>",
+	"<｜tool call begin｜>",
+	"<｜tool calls end｜>",
+	"<｜tool call end｜>",
+}
+
+func matchDSMLTag(s string) (int, bool) {
+	if len(s) < 2 {
+		return 0, true
+	}
+	for _, t := range dsmlTags {
+		if strings.HasPrefix(t, s) {
+			if len(s) == len(t) {
+				return len(t), false
+			}
+			return 0, true
+		}
+		if strings.HasPrefix(s, t) {
+			return len(t), false
+		}
+	}
+	return 0, false
+}
+
+func findScrubTagClose(rest, name string) (int, int) {
+	candidates := []string{"</" + name + ">"}
+	// DeepSeek DSML tool calling sequence: when reasoning and DSML tool calls
+	// are coalesced into a single thought block, the block closes with DSML tags.
+	// Pick the EARLIEST closing boundary in rest so code examples in following
+	// content are never erroneously matched as thought closures.
+	if name == "thought" {
+		candidates = append(candidates, "</｜｜DSML｜｜ calls>", "</｜｜DSML｜｜ invoke>", "</｜｜DSML｜｜ parameter>")
+	}
+	bestIdx := -1
+	bestLen := 0
+	for _, cand := range candidates {
+		idx := strings.Index(rest, cand)
+		if idx >= 0 && (bestIdx == -1 || idx < bestIdx) {
+			bestIdx = idx
+			bestLen = len(cand)
+		}
+	}
+	return bestIdx, bestLen
 }
 
 func isScrubSpace(c byte) bool {

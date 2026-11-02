@@ -370,3 +370,74 @@ func TestIssue30_TaughtTagRunNeverReachesClient(t *testing.T) {
 		}
 	}
 }
+
+func TestThoughtTagScrubber_DSMLClosingSequence(t *testing.T) {
+	s := newThoughtTagScrubber()
+	input := "<thought>\n[reasoning unavailable]\n</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>\n\n现在验证修正后的路径。"
+	out := s.feed(input)
+	if strings.Contains(out, "reasoning unavailable") || strings.Contains(out, "DSML") {
+		t.Fatalf("leaked DSML or placeholder reasoning: %q", out)
+	}
+	if !strings.Contains(out, "现在验证修正后的路径。") {
+		t.Fatalf("real content missing: %q", out)
+	}
+}
+
+func TestThoughtTagScrubber_DSMLSplitChunks(t *testing.T) {
+	s := newThoughtTagScrubber()
+	c1 := "<thought>\n[reasoning unavailable]\n</｜｜DSML｜｜ parameter>"
+	c2 := "\n</｜｜DSML｜｜ invoke>"
+	c3 := "\n</｜｜DSML｜｜ calls>\n\n现在验证修正后的路径。"
+
+	out1 := s.feed(c1)
+	out2 := s.feed(c2)
+	out3 := s.feed(c3)
+	full := out1 + out2 + out3
+	if strings.Contains(full, "reasoning unavailable") || strings.Contains(full, "DSML") {
+		t.Fatalf("leaked DSML across split chunks: %q", full)
+	}
+	if !strings.Contains(full, "现在验证修正后的路径。") {
+		t.Fatalf("real content missing from split chunks: %q", full)
+	}
+}
+
+func TestScrubTagBlocksInChunk_DSMLSplitFrames(t *testing.T) {
+	state := map[int]*thoughtTagScrubber{}
+	f1 := `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"<thought>\n[reasoning unavailable]\n</｜｜DSML｜｜ parameter>"}}]}`
+	f2 := `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"\n</｜｜DSML｜｜ invoke>"}}]}`
+	f3 := `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"\n</｜｜DSML｜｜ calls>\n\nreal answer"}}]}`
+
+	clean1 := scrubTagBlocksInChunk(f1, state)
+	clean2 := scrubTagBlocksInChunk(f2, state)
+	clean3 := scrubTagBlocksInChunk(f3, state)
+
+	for i, c := range []string{clean1, clean2, clean3} {
+		if strings.Contains(c, "DSML") || strings.Contains(c, "reasoning unavailable") {
+			t.Fatalf("frame %d leaked DSML: %s", i+1, c)
+		}
+	}
+	if !strings.Contains(clean3, "real answer") {
+		t.Fatalf("real answer lost in frame 3: %s", clean3)
+	}
+}
+
+func TestThoughtTagScrubber_EarliestClosingWinsOverCodeExample(t *testing.T) {
+	input := "<thought>[reasoning unavailable]</｜｜DSML｜｜ calls>修复示例：\n```xml\n<thought>example</thought>\n```\n以上是正常正文。"
+	state := map[int]*thoughtTagScrubber{}
+	frame := `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":` + quoteJSON(input) + `}}]}`
+	cleaned := scrubTagBlocksInChunk(frame, state)
+
+	if strings.Contains(cleaned, "reasoning unavailable") || strings.Contains(cleaned, "DSML") {
+		t.Fatalf("leaked thought/DSML prefix: %s", cleaned)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(cleaned), &obj); err != nil {
+		t.Fatalf("unmarshal cleaned: %v", err)
+	}
+	content := obj["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["content"].(string)
+	for _, want := range []string{"修复示例：", "<thought>example</thought>", "以上是正常正文。"} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("missing expected content %q in cleaned content: %q", want, content)
+		}
+	}
+}
